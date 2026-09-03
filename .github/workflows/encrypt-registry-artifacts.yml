@@ -1,0 +1,363 @@
+name: Encrypt Registry Artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  encrypt:
+    name: Encrypt and Replace Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      CITY_ARTIFACT_ID: "9897695201"
+      IDMAP_ARTIFACT_ID: "9899009561"
+
+    steps:
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          mkdir -p work/city-original
+          mkdir -p work/idmap-original
+          mkdir -p encrypted/city
+          mkdir -p encrypted/idmap
+          mkdir -p verify
+
+      # ------------------------------------------------------
+      # DOWNLOAD PLAINTEXT ARTIFACTS
+      # ------------------------------------------------------
+
+      - name: Download CITY-RESOLUTION-V1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${CITY_ARTIFACT_ID}/zip" \
+            -o work/CITY-RESOLUTION-V1.zip
+
+          unzip -t work/CITY-RESOLUTION-V1.zip
+
+          echo "CITY artifact downloaded:"
+          sha256sum work/CITY-RESOLUTION-V1.zip
+
+      - name: Download ID-MAP-V1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${IDMAP_ARTIFACT_ID}/zip" \
+            -o work/ID-MAP-V1.zip
+
+          unzip -t work/ID-MAP-V1.zip
+
+          echo "ID map artifact downloaded:"
+          sha256sum work/ID-MAP-V1.zip
+
+      # ------------------------------------------------------
+      # SAVE ORIGINAL HASHES
+      # ------------------------------------------------------
+
+      - name: Hash plaintext artifacts
+        run: |
+          set -euo pipefail
+
+          sha256sum work/CITY-RESOLUTION-V1.zip \
+            | awk '{print $1}' \
+            > work/city.sha256
+
+          sha256sum work/ID-MAP-V1.zip \
+            | awk '{print $1}' \
+            > work/idmap.sha256
+
+          echo "CITY plaintext SHA256:"
+          cat work/city.sha256
+
+          echo "ID MAP plaintext SHA256:"
+          cat work/idmap.sha256
+
+      # ------------------------------------------------------
+      # ENCRYPT
+      # ------------------------------------------------------
+
+      - name: Encrypt artifacts
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+        run: |
+          set -euo pipefail
+
+          test -n "${CITY_DATA_KEY:-}"
+
+          openssl enc \
+            -aes-256-cbc \
+            -salt \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in work/CITY-RESOLUTION-V1.zip \
+            -out encrypted/city/CITY-RESOLUTION-V1.zip.enc \
+            -pass env:CITY_DATA_KEY
+
+          openssl enc \
+            -aes-256-cbc \
+            -salt \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in work/ID-MAP-V1.zip \
+            -out encrypted/idmap/ID-MAP-V1.zip.enc \
+            -pass env:CITY_DATA_KEY
+
+          echo "Encrypted files:"
+          ls -lh encrypted/city encrypted/idmap
+
+          echo
+          echo "Encrypted SHA256:"
+          sha256sum \
+            encrypted/city/CITY-RESOLUTION-V1.zip.enc \
+            encrypted/idmap/ID-MAP-V1.zip.enc
+
+      # ------------------------------------------------------
+      # TEST DECRYPT
+      # ------------------------------------------------------
+
+      - name: Verify encryption round trip
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+        run: |
+          set -euo pipefail
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in encrypted/city/CITY-RESOLUTION-V1.zip.enc \
+            -out verify/CITY-RESOLUTION-V1.zip \
+            -pass env:CITY_DATA_KEY
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in encrypted/idmap/ID-MAP-V1.zip.enc \
+            -out verify/ID-MAP-V1.zip \
+            -pass env:CITY_DATA_KEY
+
+          cmp \
+            work/CITY-RESOLUTION-V1.zip \
+            verify/CITY-RESOLUTION-V1.zip
+
+          cmp \
+            work/ID-MAP-V1.zip \
+            verify/ID-MAP-V1.zip
+
+          CITY_ORIGINAL="$(cat work/city.sha256)"
+          CITY_VERIFY="$(sha256sum verify/CITY-RESOLUTION-V1.zip | awk '{print $1}')"
+
+          IDMAP_ORIGINAL="$(cat work/idmap.sha256)"
+          IDMAP_VERIFY="$(sha256sum verify/ID-MAP-V1.zip | awk '{print $1}')"
+
+          test "$CITY_ORIGINAL" = "$CITY_VERIFY"
+          test "$IDMAP_ORIGINAL" = "$IDMAP_VERIFY"
+
+          unzip -t verify/CITY-RESOLUTION-V1.zip
+          unzip -t verify/ID-MAP-V1.zip
+
+          echo
+          echo "CITY: VERIFIED"
+          echo "ID MAP: VERIFIED"
+
+      # ------------------------------------------------------
+      # UPLOAD ENCRYPTED REPLACEMENTS
+      # ------------------------------------------------------
+
+      - name: Upload encrypted CITY artifact
+        id: upload_city
+        uses: actions/upload-artifact@v4
+        with:
+          name: CITY-RESOLUTION-V1-ENCRYPTED
+          path: encrypted/city/CITY-RESOLUTION-V1.zip.enc
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload encrypted ID map artifact
+        id: upload_idmap
+        uses: actions/upload-artifact@v4
+        with:
+          name: ID-MAP-V1-ENCRYPTED
+          path: encrypted/idmap/ID-MAP-V1.zip.enc
+          if-no-files-found: error
+          retention-days: 90
+
+      # ------------------------------------------------------
+      # VERIFY GITHUB REGISTERED THE NEW ARTIFACTS
+      # ------------------------------------------------------
+
+      - name: Verify encrypted artifacts registered
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CITY_NEW_ID: ${{ steps.upload_city.outputs.artifact-id }}
+          IDMAP_NEW_ID: ${{ steps.upload_idmap.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+
+          echo "Encrypted CITY artifact ID: $CITY_NEW_ID"
+          echo "Encrypted ID MAP artifact ID: $IDMAP_NEW_ID"
+
+          test -n "$CITY_NEW_ID"
+          test -n "$IDMAP_NEW_ID"
+
+          curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${CITY_NEW_ID}" \
+            > /tmp/city-new.json
+
+          curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${IDMAP_NEW_ID}" \
+            > /tmp/idmap-new.json
+
+          python3 - <<'PY'
+          import json
+
+          checks = [
+              (
+                  "/tmp/city-new.json",
+                  "CITY-RESOLUTION-V1-ENCRYPTED"
+              ),
+              (
+                  "/tmp/idmap-new.json",
+                  "ID-MAP-V1-ENCRYPTED"
+              )
+          ]
+
+          for path, expected in checks:
+              with open(path) as f:
+                  data = json.load(f)
+
+              if data.get("name") != expected:
+                  raise SystemExit(
+                      f"Artifact name mismatch: "
+                      f"{data.get('name')} != {expected}"
+                  )
+
+              if data.get("expired"):
+                  raise SystemExit(
+                      f"{expected} is unexpectedly expired"
+                  )
+
+              print(
+                  "REGISTERED:",
+                  expected,
+                  "ID:",
+                  data["id"],
+                  "size:",
+                  data.get("size_in_bytes")
+              )
+          PY
+
+      # ------------------------------------------------------
+      # DELETE PLAINTEXT ONLY AFTER ALL VERIFICATION PASSES
+      # ------------------------------------------------------
+
+      - name: Delete plaintext artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Deleting plaintext CITY artifact: $CITY_ARTIFACT_ID"
+
+          CITY_CODE="$(
+            curl -sS \
+              -o /tmp/delete-city.txt \
+              -w "%{http_code}" \
+              -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${CITY_ARTIFACT_ID}"
+          )"
+
+          if [[ "$CITY_CODE" != "204" ]]; then
+            echo "CITY deletion failed: HTTP $CITY_CODE"
+            cat /tmp/delete-city.txt
+            exit 1
+          fi
+
+          echo "CITY plaintext deleted."
+
+          echo "Deleting plaintext ID map artifact: $IDMAP_ARTIFACT_ID"
+
+          IDMAP_CODE="$(
+            curl -sS \
+              -o /tmp/delete-idmap.txt \
+              -w "%{http_code}" \
+              -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${IDMAP_ARTIFACT_ID}"
+          )"
+
+          if [[ "$IDMAP_CODE" != "204" ]]; then
+            echo "ID MAP deletion failed: HTTP $IDMAP_CODE"
+            cat /tmp/delete-idmap.txt
+            exit 1
+          fi
+
+          echo "ID MAP plaintext deleted."
+
+      # ------------------------------------------------------
+      # PROVE OLD ARTIFACT IDS ARE GONE
+      # ------------------------------------------------------
+
+      - name: Verify plaintext artifacts deleted
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          for ID in \
+            "$CITY_ARTIFACT_ID" \
+            "$IDMAP_ARTIFACT_ID"
+          do
+            CODE="$(
+              curl -sS \
+                -o /dev/null \
+                -w "%{http_code}" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}"
+            )"
+
+            if [[ "$CODE" != "404" ]]; then
+              echo "ERROR: plaintext artifact $ID still exists."
+              echo "HTTP: $CODE"
+              exit 1
+            fi
+
+            echo "DELETED VERIFIED: $ID"
+          done
+
+          echo
+          echo "========================================"
+          echo "ENCRYPTION MIGRATION COMPLETE"
+          echo "========================================"
+          echo "Both encrypted replacements verified."
+          echo "Both plaintext artifacts deleted."
