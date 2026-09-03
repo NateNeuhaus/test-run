@@ -1,0 +1,258 @@
+name: Resolve Cities
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run validation first; use full only after validation passes"
+        required: true
+        default: validate
+        type: choice
+        options: [validate, full]
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_BASE: https://github.com/NateNeuhaus/test-run/releases/download/city-data-v1
+
+jobs:
+  validate:
+    if: ${{ inputs.mode == 'validate' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ["00", "05", "10", "15"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          cp map-name-to-city-fixed resolver
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("resolver"); s=p.read_text()
+          replacements={
+            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':'process.env.JSON_DIR',
+            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':'process.env.CITIES_CSV',
+            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':'process.env.ZIP_FILE',
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':'process.env.OUTPUT',
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':'process.env.DIAGNOSTICS',
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':'process.env.CHECKPOINT'
+          }
+          for a,b in replacements.items(): s=s.replace(a,b)
+          p.write_text(s)
+          PY
+          node --check resolver
+          mkdir -p json out
+
+      - name: Download and decrypt
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$CITY_DATA_KEY"
+          curl -fL --retry 5 "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" -o chunk.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+            -in chunk.enc -out chunk.tar.gz -pass env:CITY_DATA_KEY
+          tar -xzf chunk.tar.gz -C json
+          rm chunk.enc chunk.tar.gz
+
+      - name: Normalize matrix sources and make sample
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,os,random
+          root=pathlib.Path("json")
+          for p in root.glob("*.json"):
+              try: data=json.loads(p.read_text())
+              except Exception: continue
+              rows=data if isinstance(data,list) else (data.get("rows") if isinstance(data,dict) else None)
+              if rows and isinstance(rows,list) and isinstance(rows[0],list):
+                  h=[str(x or "").strip() or f"column_{i}" for i,x in enumerate(rows[0])]
+                  objs=[{h[i]:(r[i] if i<len(r) else None) for i in range(len(h))}
+                        for r in rows[1:] if isinstance(r,list)]
+                  tmp=p.with_suffix(".json.tmp"); tmp.write_text(json.dumps(objs,ensure_ascii=False)); os.replace(tmp,p)
+
+          random.seed(20260903)
+          dst=pathlib.Path("sample"); dst.mkdir()
+          files=list(root.glob("*.json")); random.shuffle(files)
+          total=0
+          for p in files[:25]:
+              try: data=json.loads(p.read_text())
+              except Exception: continue
+              rows=data if isinstance(data,list) else (list(data.values()) if isinstance(data,dict) else [])
+              rows=[r for r in rows if isinstance(r,dict)]
+              if not rows: continue
+              take=random.sample(rows,min(100,len(rows)))
+              (dst/p.name).write_text(json.dumps(take,ensure_ascii=False))
+              total+=len(take)
+          print("Validation rows:",total)
+          PY
+
+      - name: Resolve validation sample
+        env:
+          JSON_DIR: sample
+          CITIES_CSV: us-cities.csv
+          ZIP_FILE: zip-code-to-usa-city-stat.txt
+          OUTPUT: out/results.jsonl
+          DIAGNOSTICS: out/diagnostics.jsonl
+          CHECKPOINT: out/checkpoint.json
+          NODE_OPTIONS: --max-old-space-size=12000
+        run: node resolver
+
+      - name: Check output
+        run: |
+          python3 - <<'PY'
+          import json,re,pathlib,collections
+          p=pathlib.Path("out/results.jsonl")
+          rows=[json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+          counts=collections.Counter(r.get("status") for r in rows)
+          bad=[r for r in rows if r.get("city") and re.search(r"\d",str(r["city"]))]
+          print("Rows:",len(rows))
+          print("Status:",dict(counts))
+          print("Malformed city values:",len(bad))
+          for r in bad[:20]: print(json.dumps(r,ensure_ascii=False))
+          if bad: raise SystemExit("FAILED: malformed city values emitted")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ matrix.chunk }}
+          path: out/
+          retention-days: 7
+
+  full:
+    if: ${{ inputs.mode == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        chunk: ["00","01","02","03","04","05","06","07","08","09","10","11","12","13","14","15"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          cp map-name-to-city-fixed resolver
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("resolver"); s=p.read_text()
+          replacements={
+            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':'process.env.JSON_DIR',
+            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':'process.env.CITIES_CSV',
+            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':'process.env.ZIP_FILE',
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':'process.env.OUTPUT',
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':'process.env.DIAGNOSTICS',
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':'process.env.CHECKPOINT'
+          }
+          for a,b in replacements.items(): s=s.replace(a,b)
+          p.write_text(s)
+          PY
+          node --check resolver
+          mkdir -p json out
+
+      - name: Download and decrypt
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" -o chunk.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+            -in chunk.enc -out chunk.tar.gz -pass env:CITY_DATA_KEY
+          tar -xzf chunk.tar.gz -C json
+          rm chunk.enc chunk.tar.gz
+
+      - name: Normalize matrix sources
+        run: |
+          python3 - <<'PY'
+          import json,pathlib,os
+          for p in pathlib.Path("json").glob("*.json"):
+              try: data=json.loads(p.read_text())
+              except Exception: continue
+              rows=data if isinstance(data,list) else (data.get("rows") if isinstance(data,dict) else None)
+              if rows and isinstance(rows,list) and isinstance(rows[0],list):
+                  h=[str(x or "").strip() or f"column_{i}" for i,x in enumerate(rows[0])]
+                  objs=[{h[i]:(r[i] if i<len(r) else None) for i in range(len(h))}
+                        for r in rows[1:] if isinstance(r,list)]
+                  tmp=p.with_suffix(".json.tmp"); tmp.write_text(json.dumps(objs,ensure_ascii=False)); os.replace(tmp,p)
+          PY
+
+      - name: Resolve
+        env:
+          JSON_DIR: json
+          CITIES_CSV: us-cities.csv
+          ZIP_FILE: zip-code-to-usa-city-stat.txt
+          OUTPUT: out/results.jsonl
+          DIAGNOSTICS: out/diagnostics.jsonl
+          CHECKPOINT: out/checkpoint.json
+          NODE_OPTIONS: --max-old-space-size=12000
+        run: node resolver
+
+      - name: Reject malformed city outputs
+        run: |
+          python3 - <<'PY'
+          import json,re,pathlib
+          bad=[]
+          for line in pathlib.Path("out/results.jsonl").read_text().splitlines():
+              if not line.strip(): continue
+              r=json.loads(line)
+              if r.get("city") and re.search(r"\d",str(r["city"])): bad.append(r)
+          print("Malformed city values:",len(bad))
+          if bad:
+              for r in bad[:20]: print(json.dumps(r,ensure_ascii=False))
+              raise SystemExit(1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: city-results-${{ matrix.chunk }}
+          path: out/
+          retention-days: 7
+
+  merge:
+    if: ${{ inputs.mode == 'full' }}
+    needs: full
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: city-results-*
+          path: shards
+
+      - name: Merge
+        run: |
+          python3 - <<'PY'
+          import json,pathlib,collections
+          cities=collections.defaultdict(set); stats=collections.Counter()
+          for p in pathlib.Path("shards").rglob("results.jsonl"):
+              for line in p.read_text().splitlines():
+                  if not line.strip(): continue
+                  r=json.loads(line); stats[r.get("status","unknown")]+=1
+                  if r.get("name") and r.get("city"): cities[r["name"]].add(r["city"])
+          final={}; collisions={}
+          for name,vals in cities.items():
+              vals=sorted(vals)
+              final[name]=vals[0] if len(vals)==1 else vals
+              if len(vals)>1: collisions[name]=vals
+          pathlib.Path("name-to-city.json").write_text(json.dumps(final,ensure_ascii=False,indent=2)+"\n")
+          pathlib.Path("name-to-city-collisions.json").write_text(json.dumps(collisions,ensure_ascii=False,indent=2)+"\n")
+          summary={"status_counts":dict(stats),"unique_names":len(final),"name_collisions":len(collisions)}
+          pathlib.Path("merge-summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+          print(json.dumps(summary,indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FINAL-name-to-city
+          path: |
+            name-to-city.json
+            name-to-city-collisions.json
+            merge-summary.json
+          retention-days: 30
