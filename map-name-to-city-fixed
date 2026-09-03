@@ -1,0 +1,1947 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+
+/* ============================================================
+   PATHS
+   ============================================================ */
+
+const JSON_DIR =
+  "/home/ideapad/Documents/Files/temp/count/clean-up/json";
+
+const CITIES_CSV =
+  "/home/ideapad/Documents/Files/temp/us-cities.csv";
+
+const ZIP_FILE =
+  "/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt";
+
+const OUTPUT =
+  "/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl";
+
+const DIAGNOSTICS =
+  "/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl";
+
+const CHECKPOINT =
+  "/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json";
+
+const CHECKPOINT_EVERY = 250;
+
+/* ============================================================
+   STATES
+   ============================================================ */
+
+const STATES = {
+  AL: "Alabama",
+  AK: "Alaska",
+  AZ: "Arizona",
+  AR: "Arkansas",
+  CA: "California",
+  CO: "Colorado",
+  CT: "Connecticut",
+  DE: "Delaware",
+  DC: "District of Columbia",
+  FL: "Florida",
+  GA: "Georgia",
+  HI: "Hawaii",
+  ID: "Idaho",
+  IL: "Illinois",
+  IN: "Indiana",
+  IA: "Iowa",
+  KS: "Kansas",
+  KY: "Kentucky",
+  LA: "Louisiana",
+  ME: "Maine",
+  MD: "Maryland",
+  MA: "Massachusetts",
+  MI: "Michigan",
+  MN: "Minnesota",
+  MS: "Mississippi",
+  MO: "Missouri",
+  MT: "Montana",
+  NE: "Nebraska",
+  NV: "Nevada",
+  NH: "New Hampshire",
+  NJ: "New Jersey",
+  NM: "New Mexico",
+  NY: "New York",
+  NC: "North Carolina",
+  ND: "North Dakota",
+  OH: "Ohio",
+  OK: "Oklahoma",
+  OR: "Oregon",
+  PA: "Pennsylvania",
+  RI: "Rhode Island",
+  SC: "South Carolina",
+  SD: "South Dakota",
+  TN: "Tennessee",
+  TX: "Texas",
+  UT: "Utah",
+  VT: "Vermont",
+  VA: "Virginia",
+  WA: "Washington",
+  WV: "West Virginia",
+  WI: "Wisconsin",
+  WY: "Wyoming",
+};
+
+function normalize(value) {
+  return String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+const STATE_NAME_TO_CODE = new Map(
+  Object.entries(STATES).map(
+    ([code, name]) => [normalize(name), code]
+  )
+);
+
+/* ============================================================
+   GENERIC FIELD ACCESS
+   ============================================================ */
+
+function normalizedKey(key) {
+  return normalize(key).replace(/ /g, "");
+}
+
+function getField(row, ...wanted) {
+  if (
+    !row ||
+    typeof row !== "object" ||
+    Array.isArray(row)
+  ) {
+    return undefined;
+  }
+
+  for (const name of wanted) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        row,
+        name
+      )
+    ) {
+      return row[name];
+    }
+  }
+
+  const map = new Map();
+
+  for (const key of Object.keys(row)) {
+    map.set(
+      normalizedKey(key),
+      row[key]
+    );
+  }
+
+  for (const name of wanted) {
+    const key =
+      normalizedKey(name);
+
+    if (map.has(key)) {
+      return map.get(key);
+    }
+  }
+
+  return undefined;
+}
+
+function scalar(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+  if (typeof value === "object") {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+/*
+  Handles collision arrays such as:
+
+  [
+    {
+      note: "city",
+      type: "...",
+      value: "Las Vegas"
+    },
+    {
+      note: "...",
+      type: "...",
+      value: "..."
+    }
+  ]
+*/
+
+function extractValues(
+  value,
+  preferredNote = null
+) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return [];
+  }
+
+  if (!Array.isArray(value)) {
+    if (
+      typeof value === "object" &&
+      Object.prototype.hasOwnProperty.call(
+        value,
+        "value"
+      )
+    ) {
+      return extractValues(
+        value.value,
+        preferredNote
+      );
+    }
+
+    const text =
+      scalar(value);
+
+    return text
+      ? [text]
+      : [];
+  }
+
+  const preferred = [];
+  const other = [];
+
+  for (const item of value) {
+    if (
+      item &&
+      typeof item === "object"
+    ) {
+      const text =
+        scalar(item.value);
+
+      if (!text) {
+        continue;
+      }
+
+      if (
+        preferredNote &&
+        normalize(item.note) ===
+          preferredNote
+      ) {
+        preferred.push(text);
+      } else {
+        other.push(text);
+      }
+    } else {
+      const text =
+        scalar(item);
+
+      if (text) {
+        other.push(text);
+      }
+    }
+  }
+
+  return [
+    ...preferred,
+    ...other,
+  ];
+}
+
+/* ============================================================
+   CSV PARSER
+   ============================================================ */
+
+function parseCsvLine(line) {
+  const output = [];
+
+  let current = "";
+  let quoted = false;
+
+  for (
+    let i = 0;
+    i < line.length;
+    i++
+  ) {
+    const char = line[i];
+
+    if (char === '"') {
+      if (
+        quoted &&
+        line[i + 1] === '"'
+      ) {
+        current += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (
+      char === "," &&
+      !quoted
+    ) {
+      output.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  output.push(current);
+
+  return output;
+}
+
+/* ============================================================
+   LOAD CITY REFERENCE
+   ============================================================ */
+
+function loadCityReference() {
+  console.log(
+    "Loading city/state reference..."
+  );
+
+  const byState =
+    new Map();
+
+  const global =
+    new Map();
+
+  const lines =
+    fs.readFileSync(
+      CITIES_CSV,
+      "utf8"
+    )
+    .split(/\r?\n/)
+    .filter(Boolean);
+
+  const header =
+    parseCsvLine(
+      lines.shift()
+    );
+
+  const nameIndex =
+    header.indexOf("name");
+
+  const asciiIndex =
+    header.indexOf("name_ascii");
+
+  const stateIndex =
+    header.indexOf("state_code");
+
+  for (const line of lines) {
+    const columns =
+      parseCsvLine(line);
+
+    const state =
+      String(
+        columns[stateIndex] || ""
+      )
+      .trim()
+      .toUpperCase();
+
+    const canonical =
+      String(
+        columns[nameIndex] ||
+        columns[asciiIndex] ||
+        ""
+      )
+      .trim();
+
+    if (
+      !state ||
+      !canonical
+    ) {
+      continue;
+    }
+
+    if (
+      !byState.has(state)
+    ) {
+      byState.set(
+        state,
+        new Map()
+      );
+    }
+
+    const stateCities =
+      byState.get(state);
+
+    for (const alias of [
+      columns[nameIndex],
+      columns[asciiIndex],
+    ]) {
+      const key =
+        normalize(alias);
+
+      if (key) {
+        stateCities.set(
+          key,
+          canonical
+        );
+      }
+    }
+
+    const globalKey =
+      normalize(canonical);
+
+    if (
+      !global.has(globalKey)
+    ) {
+      global.set(
+        globalKey,
+        new Set()
+      );
+    }
+
+    global
+      .get(globalKey)
+      .add(state);
+  }
+
+  console.log(
+    `Loaded city reference for ${byState.size} states/DC.`
+  );
+
+  return {
+    byState,
+    global,
+  };
+}
+
+/* ============================================================
+   LOAD ZIP REFERENCE
+   ============================================================ */
+
+function loadZipReference() {
+  console.log(
+    "Loading ZIP reference..."
+  );
+
+  const byZip =
+    new Map();
+
+  const lines =
+    fs.readFileSync(
+      ZIP_FILE,
+      "utf8"
+    )
+    .split(/\r?\n/);
+
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    const columns =
+      line.split("\t");
+
+    /*
+      GeoNames columns:
+
+      0 country code
+      1 postal code
+      2 place name
+      3 state name
+      4 state code
+    */
+
+    if (
+      columns[0] !== "US"
+    ) {
+      continue;
+    }
+
+    const zip =
+      String(
+        columns[1] || ""
+      ).trim();
+
+    const city =
+      String(
+        columns[2] || ""
+      ).trim();
+
+    const state =
+      String(
+        columns[4] || ""
+      )
+      .trim()
+      .toUpperCase();
+
+    if (
+      !/^\d{5}$/.test(zip) ||
+      !city ||
+      !state
+    ) {
+      continue;
+    }
+
+    if (
+      !byZip.has(zip)
+    ) {
+      byZip.set(
+        zip,
+        []
+      );
+    }
+
+    byZip
+      .get(zip)
+      .push({
+        city,
+        state,
+      });
+  }
+
+  console.log(
+    `Loaded ${byZip.size.toLocaleString()} ZIP codes.`
+  );
+
+  return byZip;
+}
+
+const CITY_REFERENCE =
+  loadCityReference();
+
+const ZIP_REFERENCE =
+  loadZipReference();
+
+/* ============================================================
+   ZIP EXTRACTION
+   ============================================================ */
+
+function zipFromValue(value) {
+  for (
+    const text of
+    extractValues(value)
+  ) {
+    const match =
+      text.match(
+        /\b(\d{5})(?:-\d{4})?\b/
+      );
+
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function resolveZip(row) {
+  /*
+    IMPORTANT:
+
+    City is deliberately included here.
+
+    Examples from the broken source data:
+
+      City = "NV 89002"
+      City = "NE 68512"
+
+    Those contain useful ZIP evidence.
+  */
+
+  const fields = [
+    getField(
+      row,
+      "Zip",
+      "ZIP",
+      "Zip_Code",
+      "Zip Code",
+      "Postal_Code",
+      "Postal Code"
+    ),
+
+    getField(
+      row,
+      "City"
+    ),
+
+    getField(
+      row,
+      "Full_Address",
+      "Full Address",
+      "full_address",
+      "fullAddress"
+    ),
+
+    getField(
+      row,
+      "Address"
+    ),
+
+    getField(
+      row,
+      "Location"
+    ),
+
+    getField(
+      row,
+      "Plus_Code",
+      "Plus Code",
+      "plus_code"
+    ),
+  ];
+
+  for (const value of fields) {
+    const zip =
+      zipFromValue(value);
+
+    if (zip) {
+      return zip;
+    }
+  }
+
+  return null;
+}
+
+/* ============================================================
+   STATE EXTRACTION
+   ============================================================ */
+
+function stateFromValue(value) {
+  for (
+    const text of
+    extractValues(value, "state")
+  ) {
+    const trimmed =
+      text.trim();
+
+    const upper =
+      trimmed.toUpperCase();
+
+    if (
+      STATES[upper]
+    ) {
+      return upper;
+    }
+
+    const full =
+      STATE_NAME_TO_CODE.get(
+        normalize(trimmed)
+      );
+
+    if (full) {
+      return full;
+    }
+
+    /*
+      Handles:
+
+      NV 89002
+      Las Vegas, NV 89101
+      NV, USA
+    */
+
+    const codeMatch =
+      trimmed.match(
+        /(?:^|[\s,])([A-Z]{2})(?=\s+\d{5}(?:-\d{4})?\b|[\s,]|$)/
+      );
+
+    if (
+      codeMatch &&
+      STATES[
+        codeMatch[1]
+      ]
+    ) {
+      return codeMatch[1];
+    }
+
+    for (
+      const [code, name]
+      of Object.entries(STATES)
+    ) {
+      const escaped =
+        name.replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        );
+
+      const regex =
+        new RegExp(
+          `(?:^|[^A-Za-z])${escaped}(?:$|[^A-Za-z])`,
+          "i"
+        );
+
+      if (
+        regex.test(trimmed)
+      ) {
+        return code;
+      }
+    }
+  }
+
+  return null;
+}
+
+function resolveState(
+  row,
+  filename
+) {
+  const fields = [
+    getField(
+      row,
+      "State"
+    ),
+
+    /*
+      City may actually contain
+      state + ZIP.
+    */
+    getField(
+      row,
+      "City"
+    ),
+
+    getField(
+      row,
+      "Full_Address",
+      "Full Address",
+      "full_address",
+      "fullAddress"
+    ),
+
+    getField(
+      row,
+      "Address"
+    ),
+
+    getField(
+      row,
+      "Location"
+    ),
+
+    getField(
+      row,
+      "Plus_Code",
+      "Plus Code",
+      "plus_code"
+    ),
+
+    filename,
+  ];
+
+  for (const value of fields) {
+    const state =
+      stateFromValue(value);
+
+    if (state) {
+      return state;
+    }
+  }
+
+  /*
+    Last fallback:
+    infer state from ZIP.
+  */
+
+  const zip =
+    resolveZip(row);
+
+  if (
+    zip &&
+    ZIP_REFERENCE.has(zip)
+  ) {
+    const states =
+      [
+        ...new Set(
+          ZIP_REFERENCE
+            .get(zip)
+            .map(
+              item =>
+                item.state
+            )
+        ),
+      ];
+
+    if (
+      states.length === 1
+    ) {
+      return states[0];
+    }
+  }
+
+  return null;
+}
+
+/* ============================================================
+   CITY VALIDATION
+   ============================================================ */
+
+function canonicalCity(
+  city,
+  state
+) {
+  const key =
+    normalize(city);
+
+  if (!key) {
+    return null;
+  }
+
+  if (
+    state &&
+    CITY_REFERENCE
+      .byState
+      .has(state)
+  ) {
+    const hit =
+      CITY_REFERENCE
+        .byState
+        .get(state)
+        .get(key);
+
+    if (hit) {
+      return hit;
+    }
+  }
+
+  /*
+    Without a known state, only accept
+    a city name if the reference says it
+    exists in exactly one state.
+  */
+
+  const states =
+    CITY_REFERENCE
+      .global
+      .get(key);
+
+  if (
+    states &&
+    states.size === 1
+  ) {
+    const onlyState =
+      [...states][0];
+
+    return (
+      CITY_REFERENCE
+        .byState
+        .get(onlyState)
+        .get(key) ||
+      city
+    );
+  }
+
+  return null;
+}
+
+function obviouslyNotCity(value) {
+  const text =
+    String(
+      value || ""
+    ).trim();
+
+  if (!text) {
+    return true;
+  }
+
+  /*
+    CRITICAL FIX.
+
+    Reject:
+
+      NV 89002
+      NE 68512
+      89123
+
+    as CITY values.
+
+    Their ZIP/state information is
+    still used elsewhere.
+  */
+
+  if (/\d/.test(text)) {
+    return true;
+  }
+
+  if (
+    STATES[
+      text.toUpperCase()
+    ]
+  ) {
+    return true;
+  }
+
+  if (
+    STATE_NAME_TO_CODE.has(
+      normalize(text)
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /\bcounty\b/i.test(text)
+  ) {
+    return true;
+  }
+
+  if (
+    /\b(?:usa|united states)\b/i
+      .test(text)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/* ============================================================
+   ADDRESS CITY PARSING
+   ============================================================ */
+
+function citiesFromAddress(
+  value,
+  knownState
+) {
+  const output = [];
+
+  for (
+    const text of
+    extractValues(value)
+  ) {
+    /*
+      Example:
+
+      123 Main St,
+      Las Vegas,
+      NV 89101
+    */
+
+    const regex =
+      /,\s*([^,]+?)\s*,\s*([A-Z]{2})\s+\d{5}(?:-\d{4})?\b/gi;
+
+    let match;
+
+    while (
+      (
+        match =
+          regex.exec(text)
+      )
+    ) {
+      const state =
+        match[2]
+          .toUpperCase();
+
+      if (
+        !STATES[state]
+      ) {
+        continue;
+      }
+
+      if (
+        knownState &&
+        knownState !== state
+      ) {
+        continue;
+      }
+
+      output.push({
+        city:
+          match[1].trim(),
+
+        state,
+      });
+    }
+  }
+
+  return output;
+}
+
+/* ============================================================
+   CANDIDATE SCORING
+   ============================================================ */
+
+function addCandidate(
+  candidates,
+  rawCity,
+  state,
+  score,
+  source,
+  detail
+) {
+  if (
+    obviouslyNotCity(
+      rawCity
+    )
+  ) {
+    return;
+  }
+
+  const city =
+    canonicalCity(
+      rawCity,
+      state
+    );
+
+  if (!city) {
+    return;
+  }
+
+  const key =
+    `${state || ""}|${normalize(city)}`;
+
+  if (
+    !candidates.has(key)
+  ) {
+    candidates.set(
+      key,
+      {
+        city,
+        state:
+          state || null,
+
+        score: 0,
+
+        evidence: [],
+      }
+    );
+  }
+
+  const candidate =
+    candidates.get(key);
+
+  candidate.score +=
+    score;
+
+  candidate
+    .evidence
+    .push({
+      source,
+      detail,
+      score,
+    });
+}
+
+/* ============================================================
+   CITY RESOLVER
+   ============================================================ */
+
+function resolveCity(
+  row,
+  filename
+) {
+  const state =
+    resolveState(
+      row,
+      filename
+    );
+
+  const zip =
+    resolveZip(row);
+
+  const candidates =
+    new Map();
+
+  /* -----------------------------
+     1. EXPLICIT CITY
+     ----------------------------- */
+
+  const cityField =
+    getField(
+      row,
+      "City"
+    );
+
+  for (
+    const rawCity of
+    extractValues(
+      cityField,
+      "city"
+    )
+  ) {
+    addCandidate(
+      candidates,
+      rawCity,
+      state,
+      60,
+      "explicit-city",
+      rawCity
+    );
+  }
+
+  /* -----------------------------
+     2. ZIP -> CITY
+
+     This is where:
+
+       NV 89002
+
+     becomes a real city.
+     ----------------------------- */
+
+  if (
+    zip &&
+    ZIP_REFERENCE.has(zip)
+  ) {
+    for (
+      const item of
+      ZIP_REFERENCE.get(zip)
+    ) {
+      if (
+        state &&
+        item.state !== state
+      ) {
+        continue;
+      }
+
+      addCandidate(
+        candidates,
+        item.city,
+        item.state,
+        80,
+        "zip",
+        zip
+      );
+    }
+  }
+
+  /* -----------------------------
+     3. ADDRESS
+     ----------------------------- */
+
+  const addressFields = [
+    [
+      "full-address",
+
+      getField(
+        row,
+        "Full_Address",
+        "Full Address",
+        "full_address",
+        "fullAddress"
+      ),
+    ],
+
+    [
+      "address",
+
+      getField(
+        row,
+        "Address"
+      ),
+    ],
+
+    [
+      "location",
+
+      getField(
+        row,
+        "Location"
+      ),
+    ],
+  ];
+
+  for (
+    const [
+      label,
+      value,
+    ]
+    of addressFields
+  ) {
+    for (
+      const result of
+      citiesFromAddress(
+        value,
+        state
+      )
+    ) {
+      addCandidate(
+        candidates,
+        result.city,
+        result.state,
+        50,
+        label,
+        scalar(value)
+      );
+    }
+  }
+
+  /* -----------------------------
+     RANK
+     ----------------------------- */
+
+  const ranked =
+    [...candidates.values()]
+      .sort(
+        (a, b) =>
+          b.score -
+            a.score ||
+          a.city.localeCompare(
+            b.city
+          )
+      );
+
+  if (
+    ranked.length === 0
+  ) {
+    return {
+      city: null,
+      state,
+      zip,
+
+      status:
+        "unresolved",
+
+      confidence: 0,
+
+      evidence: [],
+    };
+  }
+
+  const best =
+    ranked[0];
+
+  const second =
+    ranked[1];
+
+  const ambiguous =
+    Boolean(
+      second &&
+      second.city !==
+        best.city &&
+      second.score >=
+        best.score - 10
+    );
+
+  let confidence;
+
+  if (
+    best.score >= 130
+  ) {
+    confidence = 0.99;
+  } else if (
+    best.score >= 80
+  ) {
+    confidence = 0.94;
+  } else if (
+    best.score >= 60
+  ) {
+    confidence = 0.88;
+  } else {
+    confidence = 0.78;
+  }
+
+  const evidenceSources =
+    new Set(
+      best.evidence.map(
+        item =>
+          item.source
+      )
+    );
+
+  if (
+    evidenceSources.size >= 2
+  ) {
+    confidence =
+      Math.min(
+        0.99,
+        confidence + 0.04
+      );
+  }
+
+  if (ambiguous) {
+    confidence =
+      Math.min(
+        confidence,
+        0.70
+      );
+  }
+
+  return {
+    city:
+      best.city,
+
+    state:
+      best.state ||
+      state,
+
+    zip,
+
+    status:
+      ambiguous
+        ? "ambiguous"
+        : "resolved",
+
+    confidence,
+
+    evidence:
+      best.evidence,
+
+    alternatives:
+      ambiguous
+        ? ranked.slice(
+            1,
+            4
+          )
+        : undefined,
+  };
+}
+
+/* ============================================================
+   SOURCE ROW HANDLING
+   ============================================================ */
+
+function rowsFromJson(data) {
+  if (
+    Array.isArray(data)
+  ) {
+    return data;
+  }
+
+  if (
+    !data ||
+    typeof data !== "object"
+  ) {
+    return [];
+  }
+
+  if (
+    Array.isArray(
+      data.rows
+    )
+  ) {
+    return data.rows;
+  }
+
+  const values =
+    Object.values(data);
+
+  if (
+    values.length &&
+    values.every(
+      value =>
+        value &&
+        typeof value ===
+          "object"
+    )
+  ) {
+    return values;
+  }
+
+  return [];
+}
+
+function businessName(row) {
+  const fields = [
+    getField(
+      row,
+      "Name"
+    ),
+
+    getField(
+      row,
+      "Business_Name",
+      "Business Name"
+    ),
+
+    getField(
+      row,
+      "Company_Name",
+      "Company Name"
+    ),
+
+    getField(
+      row,
+      "Title"
+    ),
+  ];
+
+  for (
+    const value of fields
+  ) {
+    const text =
+      scalar(value);
+
+    if (text) {
+      return text;
+    }
+  }
+
+  return null;
+}
+
+/* ============================================================
+   PERSISTENCE
+   ============================================================ */
+
+function appendJsonLine(
+  filename,
+  object
+) {
+  fs.appendFileSync(
+    filename,
+    JSON.stringify(object) +
+      "\n"
+  );
+}
+
+function saveCheckpoint(
+  checkpoint
+) {
+  const temporary =
+    `${CHECKPOINT}.tmp`;
+
+  fs.writeFileSync(
+    temporary,
+    JSON.stringify(
+      checkpoint,
+      null,
+      2
+    ) + "\n"
+  );
+
+  fs.renameSync(
+    temporary,
+    CHECKPOINT
+  );
+}
+
+function loadCheckpoint() {
+  if (
+    !fs.existsSync(
+      CHECKPOINT
+    )
+  ) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(
+      fs.readFileSync(
+        CHECKPOINT,
+        "utf8"
+      )
+    );
+  } catch (error) {
+    console.error(
+      "WARNING: checkpoint could not be read."
+    );
+
+    return null;
+  }
+}
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+function main() {
+  for (
+    const required of [
+      JSON_DIR,
+      CITIES_CSV,
+      ZIP_FILE,
+    ]
+  ) {
+    if (
+      !fs.existsSync(
+        required
+      )
+    ) {
+      throw new Error(
+        `Missing: ${required}`
+      );
+    }
+  }
+
+  const files =
+    fs.readdirSync(
+      JSON_DIR
+    )
+    .filter(
+      filename =>
+        filename
+          .toLowerCase()
+          .endsWith(
+            ".json"
+          )
+    );
+
+  const checkpoint =
+    loadCheckpoint();
+
+  const completedFiles =
+    new Set(
+      checkpoint
+        ?.completedFiles ||
+      []
+    );
+
+  let resumeFile =
+    checkpoint
+      ?.currentFile ||
+    null;
+
+  let resumeRow =
+    Number(
+      checkpoint
+        ?.nextRow ||
+      0
+    );
+
+  let processed =
+    Number(
+      checkpoint
+        ?.processed ||
+      0
+    );
+
+  let resolved =
+    Number(
+      checkpoint
+        ?.resolved ||
+      0
+    );
+
+  let ambiguous =
+    Number(
+      checkpoint
+        ?.ambiguous ||
+      0
+    );
+
+  let unresolved =
+    Number(
+      checkpoint
+        ?.unresolved ||
+      0
+    );
+
+  console.log(
+    "\n========================================"
+  );
+
+  console.log(
+    " RESUMABLE NAME -> CITY RESOLVER"
+  );
+
+  console.log(
+    "========================================\n"
+  );
+
+  console.log(
+    `Sources:     ${files.length}`
+  );
+
+  console.log(
+    `Output:      ${OUTPUT}`
+  );
+
+  console.log(
+    `Diagnostics: ${DIAGNOSTICS}`
+  );
+
+  console.log(
+    `Checkpoint:  ${CHECKPOINT}`
+  );
+
+  console.log(
+    `Save every:  ${CHECKPOINT_EVERY} rows`
+  );
+
+  if (checkpoint) {
+    console.log(
+      "\nRESUMING"
+    );
+
+    console.log(
+      `Processed: ${processed.toLocaleString()}`
+    );
+
+    console.log(
+      `File: ${resumeFile || "(between files)"}`
+    );
+
+    console.log(
+      `Next row: ${(
+        resumeRow + 1
+      ).toLocaleString()}`
+    );
+  }
+
+  /* ========================================================
+     FILE LOOP
+     ======================================================== */
+
+  for (
+    let fileIndex = 0;
+    fileIndex <
+      files.length;
+    fileIndex++
+  ) {
+    const filename =
+      files[fileIndex];
+
+    if (
+      completedFiles.has(
+        filename
+      )
+    ) {
+      console.log(
+        `[FILE ${fileIndex + 1}/${files.length}] SKIP completed: ${filename}`
+      );
+
+      continue;
+    }
+
+    console.log(
+      `\n----------------------------------------`
+    );
+
+    console.log(
+      `[FILE ${fileIndex + 1}/${files.length}] ${filename}`
+    );
+
+    console.log(
+      `----------------------------------------`
+    );
+
+    const fullPath =
+      path.join(
+        JSON_DIR,
+        filename
+      );
+
+    let data;
+
+    try {
+      data =
+        JSON.parse(
+          fs.readFileSync(
+            fullPath,
+            "utf8"
+          )
+        );
+    } catch (error) {
+      console.error(
+        `FILE ERROR: ${error.message}`
+      );
+
+      appendJsonLine(
+        DIAGNOSTICS,
+        {
+          filename,
+          status:
+            "file-error",
+          error:
+            error.message,
+        }
+      );
+
+      completedFiles.add(
+        filename
+      );
+
+      saveCheckpoint({
+        completedFiles:
+          [...completedFiles],
+
+        currentFile:
+          null,
+
+        nextRow:
+          0,
+
+        processed,
+        resolved,
+        ambiguous,
+        unresolved,
+      });
+
+      continue;
+    }
+
+    const rows =
+      rowsFromJson(data);
+
+    let startRow = 0;
+
+    if (
+      filename ===
+      resumeFile
+    ) {
+      startRow =
+        Math.min(
+          resumeRow,
+          rows.length
+        );
+    }
+
+    console.log(
+      `Rows: ${rows.length.toLocaleString()}`
+    );
+
+    console.log(
+      `Starting row: ${(startRow + 1).toLocaleString()}`
+    );
+
+    /* ======================================================
+       ROW LOOP
+       ====================================================== */
+
+    for (
+      let rowIndex =
+        startRow;
+
+      rowIndex <
+        rows.length;
+
+      rowIndex++
+    ) {
+      const row =
+        rows[rowIndex];
+
+      processed++;
+
+      const name =
+        businessName(row);
+
+      if (!name) {
+        appendJsonLine(
+          DIAGNOSTICS,
+          {
+            filename,
+            row:
+              rowIndex + 1,
+
+            status:
+              "no-name",
+          }
+        );
+
+        console.log(
+          `[NO-NAME] ${fileIndex + 1}/${files.length} ` +
+          `row ${rowIndex + 1}/${rows.length}`
+        );
+      } else {
+        const result =
+          resolveCity(
+            row,
+            filename
+          );
+
+        if (
+          result.status ===
+          "resolved"
+        ) {
+          resolved++;
+        } else if (
+          result.status ===
+          "ambiguous"
+        ) {
+          ambiguous++;
+        } else {
+          unresolved++;
+        }
+
+        /*
+          WRITE RESULT IMMEDIATELY.
+
+          This is deliberately JSONL.
+
+          Each line is independently valid JSON.
+          We do NOT need the entire dataset in RAM.
+        */
+
+        appendJsonLine(
+          OUTPUT,
+          {
+            name,
+
+            city:
+              result.city,
+
+            state:
+              result.state,
+
+            zip:
+              result.zip,
+
+            source_file:
+              filename,
+
+            source_row:
+              rowIndex + 1,
+
+            status:
+              result.status,
+
+            confidence:
+              result.confidence,
+          }
+        );
+
+        appendJsonLine(
+          DIAGNOSTICS,
+          {
+            name,
+
+            filename,
+
+            row:
+              rowIndex + 1,
+
+            ...result,
+          }
+        );
+
+        const marker =
+          result.status ===
+          "resolved"
+            ? "OK"
+            : result.status ===
+                "ambiguous"
+              ? "AMBIG"
+              : "MISS";
+
+        console.log(
+          `[${marker}] ` +
+          `${fileIndex + 1}/${files.length} ` +
+          `row ${rowIndex + 1}/${rows.length} | ` +
+          `${name} -> ` +
+          `${result.city || "(unresolved)"}` +
+          `${result.state ? ", " + result.state : ""}` +
+          `${result.zip ? " | ZIP " + result.zip : ""}`
+        );
+      }
+
+      /*
+        CHECKPOINT.
+
+        nextRow is zero-based index of the
+        NEXT row to process.
+      */
+
+      if (
+        (
+          rowIndex + 1
+        ) %
+          CHECKPOINT_EVERY ===
+        0
+      ) {
+        saveCheckpoint({
+          completedFiles:
+            [...completedFiles],
+
+          currentFile:
+            filename,
+
+          nextRow:
+            rowIndex + 1,
+
+          processed,
+          resolved,
+          ambiguous,
+          unresolved,
+
+          savedAt:
+            new Date()
+              .toISOString(),
+        });
+
+        console.log(
+          `>>> CHECKPOINT SAVED | ` +
+          `processed=${processed.toLocaleString()} | ` +
+          `resolved=${resolved.toLocaleString()} | ` +
+          `ambiguous=${ambiguous.toLocaleString()} | ` +
+          `unresolved=${unresolved.toLocaleString()}`
+        );
+      }
+    }
+
+    /*
+      Release reference to the giant source object
+      before opening another file.
+    */
+
+    data = null;
+
+    completedFiles.add(
+      filename
+    );
+
+    resumeFile =
+      null;
+
+    resumeRow =
+      0;
+
+    saveCheckpoint({
+      completedFiles:
+        [...completedFiles],
+
+      currentFile:
+        null,
+
+      nextRow:
+        0,
+
+      processed,
+      resolved,
+      ambiguous,
+      unresolved,
+
+      savedAt:
+        new Date()
+          .toISOString(),
+    });
+
+    console.log(
+      `>>> FILE COMPLETE: ${filename}`
+    );
+  }
+
+  console.log(
+    "\n========================================"
+  );
+
+  console.log(
+    " COMPLETE"
+  );
+
+  console.log(
+    "========================================\n"
+  );
+
+  console.log(
+    `Processed:  ${processed.toLocaleString()}`
+  );
+
+  console.log(
+    `Resolved:   ${resolved.toLocaleString()}`
+  );
+
+  console.log(
+    `Ambiguous:  ${ambiguous.toLocaleString()}`
+  );
+
+  console.log(
+    `Unresolved: ${unresolved.toLocaleString()}`
+  );
+
+  console.log(
+    `\nOutput:\n${OUTPUT}`
+  );
+
+  console.log(
+    `\nDiagnostics:\n${DIAGNOSTICS}`
+  );
+
+  console.log(
+    `\nCheckpoint:\n${CHECKPOINT}`
+  );
+}
+
+main();
