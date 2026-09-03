@@ -3,149 +3,142 @@ name: Indexed Value Encryption
 on:
   workflow_dispatch:
     inputs:
-
       artifact_id:
-        description: "Encrypted GitHub Actions artifact ID"
+        description: "Encrypted source artifact ID"
         required: true
         type: string
 
       input_file:
-        description: "JSON file inside decrypted ZIP"
+        description: "JSON file inside decrypted artifact"
         required: true
         type: string
 
       output_file:
-        description: "Output JSON filename"
+        description: "Final indexed encrypted JSON filename"
         required: true
         type: string
 
       output_artifact:
-        description: "Output GitHub artifact name"
+        description: "Final GitHub artifact name"
         required: true
         type: string
 
+      workers:
+        description: "Parallel worker count"
+        required: true
+        default: "16"
+        type: string
+
 permissions:
-  actions: read
   contents: read
+  actions: read
 
 jobs:
 
-  transform:
-    name: Build Indexed Encrypted Map
+  # ==========================================================
+  # PREPARE
+  #
+  # Download canonical encrypted artifact once.
+  # Decrypt outer AES-CBC package.
+  # Extract requested JSON.
+  # Split it deterministically.
+  # ==========================================================
 
+  prepare:
     runs-on: ubuntu-latest
 
-    timeout-minutes: 120
-
-    env:
-      SOURCE_ARTIFACT_ID: ${{ inputs.artifact_id }}
-      INPUT_FILE: ${{ inputs.input_file }}
-      OUTPUT_FILE: ${{ inputs.output_file }}
-      OUTPUT_ARTIFACT: ${{ inputs.output_artifact }}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      source_records: ${{ steps.meta.outputs.source_records }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # ======================================================
-      # PREPARE
-      # ======================================================
-
-      - name: Prepare
+      - name: Validate worker count
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p source
-          mkdir -p decrypted
-          mkdir -p extracted
-          mkdir -p output
+          WORKERS='${{ inputs.workers }}'
 
-      # ======================================================
-      # DOWNLOAD ACTIONS ARTIFACT
-      # ======================================================
-
-      - name: Download encrypted artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          echo "Artifact ID: $SOURCE_ARTIFACT_ID"
-
-          curl -fL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
-            -o source/actions-artifact.zip
-
-          echo
-          echo "Actions artifact downloaded:"
-          ls -lh source/actions-artifact.zip
-
-          unzip -t source/actions-artifact.zip
-
-      # ======================================================
-      # UNPACK ACTIONS WRAPPER
-      #
-      # GitHub Actions itself gives us a ZIP containing the
-      # encrypted payload, e.g.
-      #
-      # ID-MAP-V1.zip.enc
-      # ======================================================
-
-      - name: Unpack Actions artifact
-        run: |
-          set -euo pipefail
-
-          unzip -q \
-            source/actions-artifact.zip \
-            -d source/payload
-
-          echo "Artifact contents:"
-          find source/payload -type f -maxdepth 3 -print
-
-          ENC_COUNT="$(
-            find source/payload \
-              -type f \
-              -name '*.enc' \
-              | wc -l
-          )"
-
-          if [[ "$ENC_COUNT" -ne 1 ]]; then
-            echo
-            echo "ERROR:"
-            echo "Expected exactly one .enc payload."
-            echo "Found: $ENC_COUNT"
+          if ! [[ "$WORKERS" =~ ^[0-9]+$ ]]; then
+            echo "Invalid workers: $WORKERS"
             exit 1
           fi
 
-          find source/payload \
-            -type f \
-            -name '*.enc' \
-            -print -quit \
-            > source/enc-path.txt
+          if [ "$WORKERS" -lt 1 ] || [ "$WORKERS" -gt 64 ]; then
+            echo "workers must be between 1 and 64"
+            exit 1
+          fi
 
-      # ======================================================
-      # DECRYPT OUTER ENCRYPTED ZIP
-      #
-      # Same encryption used by canonical artifacts:
-      #
-      # AES-256-CBC
-      # PBKDF2
-      # 200000 iterations
-      # SHA-256
-      # ======================================================
-
-      - name: Decrypt canonical payload
+      - name: Download encrypted source artifact
         env:
-          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          test -n "${CITY_DATA_KEY:-}"
+          mkdir -p work/artifact
 
-          ENC_FILE="$(cat source/enc-path.txt)"
+          echo "Downloading artifact ID: $ARTIFACT_ID"
 
-          echo "Decrypting:"
-          echo "$ENC_FILE"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -o work/artifact-wrapper.zip
+
+          unzip -q \
+            work/artifact-wrapper.zip \
+            -d work/artifact
+
+          echo "Artifact contents:"
+          find work/artifact -type f -print
+
+      - name: Find encrypted payload
+        id: encrypted
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t FILES < <(
+            find work/artifact \
+              -type f \
+              -name '*.enc' \
+              -print
+          )
+
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            echo "Expected exactly one .enc file."
+            echo "Found: ${#FILES[@]}"
+            printf '%s\n' "${FILES[@]}"
+            exit 1
+          fi
+
+          echo "file=${FILES[0]}" >> "$GITHUB_OUTPUT"
+
+          echo "Encrypted payload:"
+          echo "${FILES[0]}"
+
+      - name: Decrypt canonical package
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+          ENCRYPTED_FILE: ${{ steps.encrypted.outputs.file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CITY_DATA_KEY:-}" ]; then
+            echo "CITY_DATA_KEY is unavailable."
+            exit 1
+          fi
 
           openssl enc \
             -d \
@@ -153,300 +146,331 @@ jobs:
             -pbkdf2 \
             -iter 200000 \
             -md sha256 \
-            -in "$ENC_FILE" \
-            -out decrypted/payload.zip \
-            -pass env:CITY_DATA_KEY
+            -pass env:CITY_DATA_KEY \
+            -in "$ENCRYPTED_FILE" \
+            -out work/payload.zip
 
-          unzip -t decrypted/payload.zip
+          unzip -t work/payload.zip
 
-          echo
-          echo "Canonical ZIP decrypted successfully."
-
-      # ======================================================
-      # UNZIP CANONICAL DATA
-      # ======================================================
-
-      - name: Extract canonical ZIP
-        run: |
-          set -euo pipefail
+          mkdir -p work/payload
 
           unzip -q \
-            decrypted/payload.zip \
-            -d extracted
+            work/payload.zip \
+            -d work/payload
 
-          echo "Extracted files:"
-          find extracted -type f -print
+          echo "Decrypted package:"
+          find work/payload -type f -print
 
-      # ======================================================
-      # FIND REQUESTED JSON
-      # ======================================================
-
-      - name: Locate input JSON
+      - name: Locate requested JSON
+        id: input
+        env:
+          REQUESTED_FILE: ${{ inputs.input_file }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          MATCH_COUNT="$(
-            find extracted \
+          mapfile -t MATCHES < <(
+            find work/payload \
               -type f \
-              -name "$INPUT_FILE" \
-              | wc -l
-          )"
+              -name "$REQUESTED_FILE" \
+              -print
+          )
 
-          if [[ "$MATCH_COUNT" -ne 1 ]]; then
-            echo
-            echo "ERROR:"
+          if [ "${#MATCHES[@]}" -ne 1 ]; then
             echo "Expected exactly one file named:"
-            echo "$INPUT_FILE"
+            echo "$REQUESTED_FILE"
             echo
-            echo "Found: $MATCH_COUNT"
-            echo
-            echo "Available files:"
-            find extracted -type f -print
+            echo "Found: ${#MATCHES[@]}"
+            printf '%s\n' "${MATCHES[@]}"
             exit 1
           fi
 
-          find extracted \
-            -type f \
-            -name "$INPUT_FILE" \
-            -print -quit \
-            > source/input-path.txt
+          cp "${MATCHES[0]}" work/input.json
 
           echo "Input:"
-          cat source/input-path.txt
+          echo "${MATCHES[0]}"
 
-      # ======================================================
-      # TRANSFORM
-      #
-      # JSON:
-      #
-      # {
-      #   "0001-000001": "Business Name"
-      # }
-      #
-      # becomes:
-      #
-      # {
-      #   "0001-000001": "v1:<nonce>:<ciphertext>:<tag>"
-      # }
-      #
-      # Keys remain EXACTLY unchanged.
-      #
-      # AES-256-GCM per value.
-      #
-      # Key:
-      # SHA-256(CITY_DATA_KEY)
-      #
-      # Nonce:
-      # random 96-bit nonce per value.
-      #
-      # AAD:
-      # the plaintext JSON key.
-      #
-      # This cryptographically binds each encrypted value
-      # to the ID it belongs to.
-      # ======================================================
+          sha256sum work/input.json
 
-      - name: Encrypt JSON values
-        env:
-          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+      - name: Verify splitter
+        shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/encrypt-values.js <<'NODE'
-          const fs = require("fs");
-          const crypto = require("crypto");
-          const path = require("path");
+          test -f parallel-splitter.js
 
-          const inputPath =
-            fs.readFileSync(
-              "source/input-path.txt",
-              "utf8"
-            ).trim();
+          node --check parallel-splitter.js
 
-          const outputFilename =
-            process.env.OUTPUT_FILE;
+          grep -q \
+            'PARALLEL SPLITTER' \
+            parallel-splitter.js
 
-          const outputPath =
-            path.join(
-              "output",
-              outputFilename
+      - name: Split input
+        env:
+          WORKERS: ${{ inputs.workers }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node parallel-splitter.js \
+            --input work/input.json \
+            --output work/shards \
+            --workers "$WORKERS"
+
+      - name: Read split metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_RECORDS="$(
+            node -e '
+              const m =
+                require("./work/shards/manifest.json");
+
+              process.stdout.write(
+                String(m.source_records)
+              );
+            '
+          )"
+
+          echo "source_records=$SOURCE_RECORDS" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "Source records: $SOURCE_RECORDS"
+
+      - name: Build worker matrix
+        id: matrix
+        env:
+          WORKERS: ${{ inputs.workers }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MATRIX="$(
+            node - "$WORKERS" <<'NODE'
+          const workers = Number(process.argv[2]);
+
+          const width =
+            Math.max(
+              2,
+              String(workers - 1).length
             );
+
+          const include = [];
+
+          for (
+            let worker = 0;
+            worker < workers;
+            worker++
+          ) {
+            include.push({
+              worker,
+              shard:
+                String(worker)
+                  .padStart(width, "0")
+            });
+          }
+
+          process.stdout.write(
+            JSON.stringify({ include })
+          );
+          NODE
+          )"
+
+          echo "Matrix:"
+          echo "$MATRIX"
+
+          echo "matrix=$MATRIX" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Upload split shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexed-encryption-input
+          path: |
+            work/shards/
+          if-no-files-found: error
+          retention-days: 1
+
+
+  # ==========================================================
+  # PROCESS
+  #
+  # 16-way matrix by default.
+  #
+  # Each worker:
+  #   - downloads the split package
+  #   - selects exactly one shard
+  #   - independently encrypts every value
+  #   - leaves keys plaintext
+  #   - verifies every ciphertext by decrypting it immediately
+  # ==========================================================
+
+  process:
+    needs: prepare
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Download split shards
+        uses: actions/download-artifact@v4
+        with:
+          name: indexed-encryption-input
+          path: work/shards
+
+      - name: Show worker
+        shell: bash
+        run: |
+          echo "Worker: ${{ matrix.worker }}"
+          echo "Shard:  ${{ matrix.shard }}"
+
+      - name: Encrypt shard values
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+          SHARD_ID: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INPUT="work/shards/shard-${SHARD_ID}.json"
+          OUTPUT="work/encrypted-${SHARD_ID}.json"
+
+          if [ ! -f "$INPUT" ]; then
+            echo "Missing shard: $INPUT"
+            exit 1
+          fi
+
+          node - "$INPUT" "$OUTPUT" <<'NODE'
+          "use strict";
+
+          const fs =
+            require("fs");
+
+          const crypto =
+            require("crypto");
+
+          const inputFile =
+            process.argv[2];
+
+          const outputFile =
+            process.argv[3];
 
           const secret =
             process.env.CITY_DATA_KEY;
 
           if (!secret) {
             throw new Error(
-              "CITY_DATA_KEY is missing"
+              "CITY_DATA_KEY unavailable"
             );
           }
 
-          // --------------------------------------------------
-          // Derive fixed 256-bit encryption key.
+          // ==================================================
+          // KDF
           //
-          // Version 1 derivation:
-          // SHA-256 over CITY_DATA_KEY UTF-8 bytes.
-          // --------------------------------------------------
+          // Stable domain-separated key derivation.
+          //
+          // The secret itself is never written.
+          // ==================================================
 
           const encryptionKey =
             crypto
-              .createHash("sha256")
-              .update(
+              .createHmac(
+                "sha256",
                 Buffer.from(
                   secret,
                   "utf8"
                 )
               )
+              .update(
+                "mtc:indexed-value-encryption:v1",
+                "utf8"
+              )
               .digest();
 
-          // --------------------------------------------------
-          // Read JSON
-          // --------------------------------------------------
+          function encode(buffer) {
+            return buffer
+              .toString("base64")
+              .replace(/\+/g, "-")
+              .replace(/\//g, "_")
+              .replace(/=+$/g, "");
+          }
 
-          console.log(
-            "Reading:",
-            inputPath
-          );
+          function decode(value) {
+            let s =
+              value
+                .replace(/-/g, "+")
+                .replace(/_/g, "/");
 
-          const raw =
-            fs.readFileSync(
-              inputPath,
-              "utf8"
-            );
+            while (
+              s.length % 4
+            ) {
+              s += "=";
+            }
 
-          const data =
-            JSON.parse(raw);
-
-          if (
-            data === null ||
-            Array.isArray(data) ||
-            typeof data !== "object"
-          ) {
-            throw new Error(
-              "Input JSON root must be an object"
+            return Buffer.from(
+              s,
+              "base64"
             );
           }
 
-          const keys =
-            Object.keys(data);
-
-          console.log(
-            "Keys:",
-            keys.length.toLocaleString()
-          );
-
-          // --------------------------------------------------
-          // Stream output.
-          //
-          // Do NOT build a second million-entry object.
-          // --------------------------------------------------
-
-          const fd =
-            fs.openSync(
-              outputPath,
-              "w"
-            );
-
-          fs.writeSync(
-            fd,
-            "{\n"
-          );
-
-          let encryptedCount = 0;
-
-          let stringCount = 0;
-          let nullCount = 0;
-          let objectCount = 0;
-          let arrayCount = 0;
-          let numberCount = 0;
-          let booleanCount = 0;
-
-          for (
-            let i = 0;
-            i < keys.length;
-            i++
-          ) {
-
-            const key =
-              keys[i];
-
-            const value =
-              data[key];
-
-            // ----------------------------------------------
-            // Preserve original JSON value semantics.
-            //
-            // Strings remain strings after decrypt.
-            // Arrays/objects/numbers/etc are serialized as
-            // JSON and marked by type.
-            // ----------------------------------------------
-
-            let type;
-            let plaintext;
-
-            if (
-              typeof value === "string"
-            ) {
-
-              type = "s";
-              plaintext = value;
-              stringCount++;
-
-            } else if (
-              value === null
-            ) {
-
-              type = "0";
-              plaintext = "null";
-              nullCount++;
-
-            } else if (
-              Array.isArray(value)
-            ) {
-
-              type = "a";
-              plaintext =
-                JSON.stringify(value);
-              arrayCount++;
-
-            } else if (
-              typeof value === "object"
-            ) {
-
-              type = "o";
-              plaintext =
-                JSON.stringify(value);
-              objectCount++;
-
-            } else if (
-              typeof value === "number"
-            ) {
-
-              type = "n";
-              plaintext =
-                JSON.stringify(value);
-              numberCount++;
-
-            } else if (
-              typeof value === "boolean"
-            ) {
-
-              type = "b";
-              plaintext =
-                value ? "true" : "false";
-              booleanCount++;
-
-            } else {
-
-              throw new Error(
-                `Unsupported value type at key ${key}`
-              );
-
+          function valueType(value) {
+            if (value === null) {
+              return "0";
             }
 
-            // ----------------------------------------------
-            // Unique 96-bit nonce.
-            // ----------------------------------------------
+            if (
+              Array.isArray(value)
+            ) {
+              return "a";
+            }
+
+            switch (
+              typeof value
+            ) {
+              case "string":
+                return "s";
+
+              case "number":
+                return "n";
+
+              case "boolean":
+                return "b";
+
+              case "object":
+                return "o";
+
+              default:
+                throw new Error(
+                  "Unsupported JSON value type"
+                );
+            }
+          }
+
+          function serialize(value) {
+            return Buffer.from(
+              JSON.stringify(value),
+              "utf8"
+            );
+          }
+
+          function deserialize(buffer) {
+            return JSON.parse(
+              buffer.toString("utf8")
+            );
+          }
+
+          function encryptValue(
+            id,
+            value
+          ) {
+            const type =
+              valueType(value);
 
             const nonce =
               crypto.randomBytes(12);
@@ -458,19 +482,22 @@ jobs:
                 nonce
               );
 
-            // Bind ciphertext to plaintext ID/key.
+            // Bind ciphertext to its plaintext ID.
+            //
+            // Moving ciphertext from one ID to another
+            // causes authentication failure.
+
             cipher.setAAD(
               Buffer.from(
-                key,
+                id,
                 "utf8"
               )
             );
 
-            const encrypted =
+            const ciphertext =
               Buffer.concat([
                 cipher.update(
-                  plaintext,
-                  "utf8"
+                  serialize(value)
                 ),
                 cipher.final()
               ]);
@@ -478,294 +505,543 @@ jobs:
             const tag =
               cipher.getAuthTag();
 
-            // ----------------------------------------------
-            // Compact base64url representation:
-            //
-            // v1:type:nonce:ciphertext:tag
-            // ----------------------------------------------
-
-            const encoded =
-              [
-                "v1",
-                type,
-                nonce.toString(
-                  "base64url"
-                ),
-                encrypted.toString(
-                  "base64url"
-                ),
-                tag.toString(
-                  "base64url"
-                )
-              ].join(":");
-
-            const line =
-              "  " +
-              JSON.stringify(key) +
-              ": " +
-              JSON.stringify(encoded) +
-              (
-                i + 1 < keys.length
-                  ? ",\n"
-                  : "\n"
-              );
-
-            fs.writeSync(
-              fd,
-              line
-            );
-
-            encryptedCount++;
-
-            if (
-              encryptedCount % 100000 === 0
-            ) {
-
-              console.log(
-                "Encrypted:",
-                encryptedCount
-                  .toLocaleString()
-              );
-
-            }
-
+            return [
+              "v1",
+              type,
+              encode(nonce),
+              encode(ciphertext),
+              encode(tag)
+            ].join(":");
           }
 
-          fs.writeSync(
-            fd,
-            "}\n"
-          );
+          function decryptValue(
+            id,
+            packed
+          ) {
+            const parts =
+              packed.split(":");
 
-          fs.closeSync(fd);
+            if (
+              parts.length !== 5 ||
+              parts[0] !== "v1"
+            ) {
+              throw new Error(
+                "Invalid encrypted value format"
+              );
+            }
 
-          // --------------------------------------------------
-          // Summary
-          // --------------------------------------------------
+            const [
+              version,
+              type,
+              nonceText,
+              ciphertextText,
+              tagText
+            ] = parts;
 
-          const summary = {
-            format:
-              "indexed-value-encryption-v1",
+            const decipher =
+              crypto.createDecipheriv(
+                "aes-256-gcm",
+                encryptionKey,
+                decode(nonceText)
+              );
 
-            algorithm:
-              "AES-256-GCM",
+            decipher.setAAD(
+              Buffer.from(
+                id,
+                "utf8"
+              )
+            );
 
-            key_derivation:
-              "SHA-256(CITY_DATA_KEY)",
+            decipher.setAuthTag(
+              decode(tagText)
+            );
 
-            nonce:
-              "96-bit random per value",
+            const plaintext =
+              Buffer.concat([
+                decipher.update(
+                  decode(ciphertextText)
+                ),
+                decipher.final()
+              ]);
 
-            authentication:
-              "128-bit GCM tag",
+            const value =
+              deserialize(plaintext);
 
-            aad:
-              "plaintext JSON key",
+            if (
+              valueType(value) !== type
+            ) {
+              throw new Error(
+                `Type verification failed for ${id}`
+              );
+            }
 
-            keys_encrypted:
-              false,
+            return value;
+          }
 
-            values_encrypted:
-              true,
+          function exactEqual(a, b) {
+            return (
+              JSON.stringify(a) ===
+              JSON.stringify(b)
+            );
+          }
 
-            records:
-              encryptedCount,
+          const input =
+            JSON.parse(
+              fs.readFileSync(
+                inputFile,
+                "utf8"
+              )
+            );
 
-            value_types: {
-              string: stringCount,
-              null: nullCount,
-              object: objectCount,
-              array: arrayCount,
-              number: numberCount,
-              boolean: booleanCount
-            },
+          if (
+            input === null ||
+            Array.isArray(input) ||
+            typeof input !== "object"
+          ) {
+            throw new Error(
+              "Indexed encryption currently requires an object root"
+            );
+          }
 
-            input_file:
-              path.basename(
-                inputPath
-              ),
+          const output =
+            Object.create(null);
 
-            output_file:
-              outputFilename
-          };
-
-          fs.writeFileSync(
-            "output/encryption-summary.json",
-            JSON.stringify(
-              summary,
-              null,
-              2
-            )
-          );
-
-          console.log("");
-          console.log(
-            "================================"
-          );
-          console.log(
-            "VALUE ENCRYPTION COMPLETE"
-          );
-          console.log(
-            "================================"
-          );
+          const entries =
+            Object.entries(input);
 
           console.log(
             "Records:",
-            encryptedCount.toLocaleString()
+            entries.length
+              .toLocaleString()
           );
 
-          console.log(
-            "Output:",
-            outputPath
-          );
-          NODE
-
-          node /tmp/encrypt-values.js
-
-      # ======================================================
-      # STRUCTURAL VERIFICATION
-      #
-      # Ensure:
-      #
-      # 1. same number of keys
-      # 2. every original key exists
-      # 3. no new keys
-      # 4. every output value encrypted
-      # ======================================================
-
-      - name: Verify plaintext keys preserved
-        run: |
-          set -euo pipefail
-
-          cat > /tmp/verify-structure.js <<'NODE'
-          const fs = require("fs");
-          const path = require("path");
-
-          const inputPath =
-            fs.readFileSync(
-              "source/input-path.txt",
-              "utf8"
-            ).trim();
-
-          const outputPath =
-            path.join(
-              "output",
-              process.env.OUTPUT_FILE
-            );
-
-          const original =
-            JSON.parse(
-              fs.readFileSync(
-                inputPath,
-                "utf8"
-              )
-            );
-
-          const encrypted =
-            JSON.parse(
-              fs.readFileSync(
-                outputPath,
-                "utf8"
-              )
-            );
-
-          const originalKeys =
-            Object.keys(original);
-
-          const encryptedKeys =
-            Object.keys(encrypted);
-
-          if (
-            originalKeys.length !==
-            encryptedKeys.length
-          ) {
-
-            throw new Error(
-              `Key count mismatch: ` +
-              `${originalKeys.length} != ` +
-              `${encryptedKeys.length}`
-            );
-
-          }
+          let encrypted = 0;
 
           for (
-            const key of originalKeys
+            const [id, value]
+            of entries
           ) {
-
-            if (
-              !Object.prototype
-                .hasOwnProperty
-                .call(
-                  encrypted,
-                  key
-                )
-            ) {
-
-              throw new Error(
-                `Missing key: ${key}`
+            const packed =
+              encryptValue(
+                id,
+                value
               );
 
-            }
-
-            const value =
-              encrypted[key];
-
-            if (
-              typeof value !== "string" ||
-              !value.startsWith("v1:")
-            ) {
-
-              throw new Error(
-                `Unencrypted value: ${key}`
+            // Immediate cryptographic round-trip.
+            const recovered =
+              decryptValue(
+                id,
+                packed
               );
 
+            if (
+              !exactEqual(
+                value,
+                recovered
+              )
+            ) {
+              throw new Error(
+                `Round-trip mismatch: ${id}`
+              );
             }
 
+            output[id] =
+              packed;
+
+            encrypted++;
+
+            if (
+              encrypted % 10000 === 0
+            ) {
+              console.log(
+                "Encrypted:",
+                encrypted
+                  .toLocaleString()
+              );
+            }
           }
 
+          if (
+            Object.keys(output).length !==
+            entries.length
+          ) {
+            throw new Error(
+              "Output key count mismatch"
+            );
+          }
+
+          fs.writeFileSync(
+            outputFile,
+            JSON.stringify(output)
+          );
+
           console.log(
-            "Key count:",
-            originalKeys.length
+            "Encrypted:",
+            encrypted
               .toLocaleString()
           );
 
           console.log(
-            "All plaintext keys preserved."
-          );
-
-          console.log(
-            "All values encrypted."
+            "Worker verification: YES"
           );
           NODE
 
-          node /tmp/verify-structure.js
+          sha256sum "$OUTPUT"
 
-      # ======================================================
-      # CRYPTOGRAPHIC ROUND-TRIP VERIFICATION
-      #
-      # Decrypt EVERY value and compare it with the original.
-      # ======================================================
+      - name: Upload encrypted shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexed-encrypted-${{ matrix.shard }}
+          path: work/encrypted-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Verify every encrypted value
-        env:
-          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+
+  # ==========================================================
+  # MERGE
+  #
+  # Rebuild one object from all encrypted shards.
+  #
+  # We deliberately do not use the original splitter manifest
+  # hashes here because processing has legitimately changed the
+  # shard contents.
+  #
+  # Instead we verify:
+  #   - every expected worker artifact exists
+  #   - exact expected number of shards
+  #   - no duplicate keys
+  #   - every value has expected encrypted format
+  #   - merged key count == original source count
+  # ==========================================================
+
+  merge:
+    needs:
+      - prepare
+      - process
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all encrypted shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: indexed-encrypted-*
+          path: work/encrypted
+          merge-multiple: true
+
+      - name: Inspect encrypted shards
+        shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/verify-values.js <<'NODE'
-          const fs = require("fs");
-          const crypto = require("crypto");
-          const path = require("path");
+          find work/encrypted \
+            -type f \
+            -name 'encrypted-*.json' \
+            -print \
+            | sort
 
-          const inputPath =
-            fs.readFileSync(
-              "source/input-path.txt",
-              "utf8"
-            ).trim();
+      - name: Merge and verify
+        env:
+          EXPECTED_RECORDS: ${{ needs.prepare.outputs.source_records }}
+          EXPECTED_WORKERS: ${{ inputs.workers }}
+          OUTPUT_FILE: ${{ inputs.output_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          const outputPath =
-            path.join(
-              "output",
-              process.env.OUTPUT_FILE
+          mkdir -p final
+
+          node - \
+            work/encrypted \
+            "final/$OUTPUT_FILE" \
+            "$EXPECTED_RECORDS" \
+            "$EXPECTED_WORKERS" <<'NODE'
+          "use strict";
+
+          const fs =
+            require("fs");
+
+          const path =
+            require("path");
+
+          const crypto =
+            require("crypto");
+
+          const inputDir =
+            process.argv[2];
+
+          const outputFile =
+            process.argv[3];
+
+          const expectedRecords =
+            Number(
+              process.argv[4]
+            );
+
+          const expectedWorkers =
+            Number(
+              process.argv[5]
+            );
+
+          if (
+            !Number.isInteger(
+              expectedRecords
+            ) ||
+            expectedRecords < 0
+          ) {
+            throw new Error(
+              "Invalid expected record count"
+            );
+          }
+
+          if (
+            !Number.isInteger(
+              expectedWorkers
+            ) ||
+            expectedWorkers < 1
+          ) {
+            throw new Error(
+              "Invalid expected worker count"
+            );
+          }
+
+          const files =
+            fs
+              .readdirSync(
+                inputDir
+              )
+              .filter(
+                name =>
+                  /^encrypted-\d+\.json$/
+                    .test(name)
+              )
+              .sort();
+
+          console.log(
+            "Encrypted shards:",
+            files.length
+          );
+
+          if (
+            files.length !==
+            expectedWorkers
+          ) {
+            throw new Error(
+              `Expected ${expectedWorkers} encrypted shards; found ${files.length}`
+            );
+          }
+
+          const merged =
+            Object.create(null);
+
+          let records = 0;
+
+          for (
+            const filename
+            of files
+          ) {
+            const fullPath =
+              path.join(
+                inputDir,
+                filename
+              );
+
+            const shard =
+              JSON.parse(
+                fs.readFileSync(
+                  fullPath,
+                  "utf8"
+                )
+              );
+
+            if (
+              shard === null ||
+              Array.isArray(shard) ||
+              typeof shard !== "object"
+            ) {
+              throw new Error(
+                `${filename} is not an object`
+              );
+            }
+
+            const entries =
+              Object.entries(shard);
+
+            console.log(
+              filename,
+              entries.length
+                .toLocaleString(),
+              "records"
+            );
+
+            for (
+              const [id, value]
+              of entries
+            ) {
+              if (
+                Object.prototype
+                  .hasOwnProperty
+                  .call(
+                    merged,
+                    id
+                  )
+              ) {
+                throw new Error(
+                  `Duplicate key: ${id}`
+                );
+              }
+
+              if (
+                typeof value !==
+                "string"
+              ) {
+                throw new Error(
+                  `Non-string encrypted value: ${id}`
+                );
+              }
+
+              if (
+                !/^v1:[s0aonb]:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/
+                  .test(value)
+              ) {
+                throw new Error(
+                  `Invalid encrypted format: ${id}`
+                );
+              }
+
+              merged[id] =
+                value;
+
+              records++;
+            }
+          }
+
+          if (
+            records !==
+            expectedRecords
+          ) {
+            throw new Error(
+              `Merged records ${records} != expected ${expectedRecords}`
+            );
+          }
+
+          fs.writeFileSync(
+            outputFile,
+            JSON.stringify(merged)
+          );
+
+          const outputHash =
+            crypto
+              .createHash(
+                "sha256"
+              )
+              .update(
+                fs.readFileSync(
+                  outputFile
+                )
+              )
+              .digest("hex");
+
+          console.log("");
+          console.log(
+            "========================================"
+          );
+          console.log(
+            "INDEXED ENCRYPTION MERGE COMPLETE"
+          );
+          console.log(
+            "========================================"
+          );
+
+          console.log(
+            "Workers:        ",
+            expectedWorkers
+          );
+
+          console.log(
+            "Source records: ",
+            expectedRecords
+              .toLocaleString()
+          );
+
+          console.log(
+            "Merged records: ",
+            records
+              .toLocaleString()
+          );
+
+          console.log(
+            "Duplicate keys: 0"
+          );
+
+          console.log(
+            "Missing keys:   0"
+          );
+
+          console.log(
+            "Output SHA256:  ",
+            outputHash
+          );
+
+          console.log(
+            "Verified:       YES"
+          );
+          NODE
+
+      # ======================================================
+      # FULL CRYPTOGRAPHIC VERIFICATION
+      #
+      # Download original split shards again.
+      # Compare EVERY final encrypted value against its original
+      # plaintext value after AES-GCM decryption.
+      #
+      # This catches:
+      #   wrong secret
+      #   corrupt ciphertext
+      #   swapped IDs
+      #   missing IDs
+      #   incorrect values
+      # ======================================================
+
+      - name: Download original shards for final verification
+        uses: actions/download-artifact@v4
+        with:
+          name: indexed-encryption-input
+          path: work/original
+
+      - name: Full cryptographic verification
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+          OUTPUT_FILE: ${{ inputs.output_file }}
+          EXPECTED_RECORDS: ${{ needs.prepare.outputs.source_records }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node - \
+            work/original \
+            "final/$OUTPUT_FILE" \
+            "$EXPECTED_RECORDS" <<'NODE'
+          "use strict";
+
+          const fs =
+            require("fs");
+
+          const path =
+            require("path");
+
+          const crypto =
+            require("crypto");
+
+          const originalDir =
+            process.argv[2];
+
+          const encryptedFile =
+            process.argv[3];
+
+          const expectedRecords =
+            Number(
+              process.argv[4]
             );
 
           const secret =
@@ -773,225 +1049,281 @@ jobs:
 
           if (!secret) {
             throw new Error(
-              "CITY_DATA_KEY missing"
+              "CITY_DATA_KEY unavailable"
             );
           }
 
           const encryptionKey =
             crypto
-              .createHash("sha256")
-              .update(
+              .createHmac(
+                "sha256",
                 Buffer.from(
                   secret,
                   "utf8"
                 )
               )
+              .update(
+                "mtc:indexed-value-encryption:v1",
+                "utf8"
+              )
               .digest();
 
-          const original =
-            JSON.parse(
-              fs.readFileSync(
-                inputPath,
-                "utf8"
-              )
-            );
+          function decode(value) {
+            let s =
+              value
+                .replace(/-/g, "+")
+                .replace(/_/g, "/");
 
-          const encrypted =
-            JSON.parse(
-              fs.readFileSync(
-                outputPath,
-                "utf8"
-              )
-            );
-
-          let checked = 0;
-
-          function expectedPlaintext(
-            value,
-            type
-          ) {
-
-            switch (type) {
-
-              case "s":
-                return value;
-
-              case "0":
-                return "null";
-
-              case "a":
-              case "o":
-              case "n":
-                return JSON.stringify(
-                  value
-                );
-
-              case "b":
-                return value
-                  ? "true"
-                  : "false";
-
-              default:
-                throw new Error(
-                  `Unknown type ${type}`
-                );
-
+            while (
+              s.length % 4
+            ) {
+              s += "=";
             }
 
+            return Buffer.from(
+              s,
+              "base64"
+            );
           }
 
-          for (
-            const [
-              key,
-              encoded
-            ] of Object.entries(
-              encrypted
-            )
+          function decryptValue(
+            id,
+            packed
           ) {
-
             const parts =
-              encoded.split(":");
+              packed.split(":");
 
             if (
               parts.length !== 5 ||
               parts[0] !== "v1"
             ) {
-
               throw new Error(
-                `Bad encrypted format: ${key}`
+                `Bad format: ${id}`
               );
-
             }
 
             const [
               version,
               type,
-              nonce64,
-              ciphertext64,
-              tag64
+              nonceText,
+              ciphertextText,
+              tagText
             ] = parts;
-
-            const nonce =
-              Buffer.from(
-                nonce64,
-                "base64url"
-              );
-
-            const ciphertext =
-              Buffer.from(
-                ciphertext64,
-                "base64url"
-              );
-
-            const tag =
-              Buffer.from(
-                tag64,
-                "base64url"
-              );
 
             const decipher =
               crypto.createDecipheriv(
                 "aes-256-gcm",
                 encryptionKey,
-                nonce
+                decode(nonceText)
               );
 
             decipher.setAAD(
               Buffer.from(
-                key,
+                id,
                 "utf8"
               )
             );
 
             decipher.setAuthTag(
-              tag
+              decode(tagText)
             );
 
             const plaintext =
               Buffer.concat([
                 decipher.update(
-                  ciphertext
+                  decode(ciphertextText)
                 ),
                 decipher.final()
-              ]).toString(
+              ]);
+
+            return JSON.parse(
+              plaintext.toString(
                 "utf8"
+              )
+            );
+          }
+
+          const encrypted =
+            JSON.parse(
+              fs.readFileSync(
+                encryptedFile,
+                "utf8"
+              )
+            );
+
+          const shardFiles =
+            fs
+              .readdirSync(
+                originalDir
+              )
+              .filter(
+                name =>
+                  /^shard-\d+\.json$/
+                    .test(name)
+              )
+              .sort();
+
+          let verified = 0;
+
+          for (
+            const filename
+            of shardFiles
+          ) {
+            const original =
+              JSON.parse(
+                fs.readFileSync(
+                  path.join(
+                    originalDir,
+                    filename
+                  ),
+                  "utf8"
+                )
               );
 
-            const expected =
-              expectedPlaintext(
-                original[key],
-                type
-              );
-
-            if (
-              plaintext !== expected
+            for (
+              const [id, value]
+              of Object.entries(
+                original
+              )
             ) {
+              if (
+                !Object.prototype
+                  .hasOwnProperty
+                  .call(
+                    encrypted,
+                    id
+                  )
+              ) {
+                throw new Error(
+                  `Missing encrypted ID: ${id}`
+                );
+              }
 
-              throw new Error(
-                `Round-trip mismatch: ${key}`
-              );
+              const recovered =
+                decryptValue(
+                  id,
+                  encrypted[id]
+                );
 
+              if (
+                JSON.stringify(
+                  recovered
+                ) !==
+                JSON.stringify(
+                  value
+                )
+              ) {
+                throw new Error(
+                  `Final value mismatch: ${id}`
+                );
+              }
+
+              verified++;
+
+              if (
+                verified % 100000 === 0
+              ) {
+                console.log(
+                  "Verified:",
+                  verified
+                    .toLocaleString()
+                );
+              }
             }
+          }
 
-            checked++;
+          if (
+            verified !==
+            expectedRecords
+          ) {
+            throw new Error(
+              `Verified ${verified} != expected ${expectedRecords}`
+            );
+          }
 
-            if (
-              checked % 100000 === 0
-            ) {
-
-              console.log(
-                "Verified:",
-                checked
-                  .toLocaleString()
-              );
-
-            }
-
+          if (
+            Object.keys(
+              encrypted
+            ).length !==
+            expectedRecords
+          ) {
+            throw new Error(
+              "Final encrypted key count mismatch"
+            );
           }
 
           console.log("");
           console.log(
-            "Cryptographically verified:",
-            checked.toLocaleString(),
-            "values"
+            "FULL CRYPTOGRAPHIC VERIFICATION"
+          );
+
+          console.log(
+            "Records:",
+            verified
+              .toLocaleString()
+          );
+
+          console.log(
+            "Exact plaintext recovery: YES"
+          );
+
+          console.log(
+            "AAD/key binding: YES"
+          );
+
+          console.log(
+            "Verification: PASSED"
           );
           NODE
 
-          node /tmp/verify-values.js
-
-      # ======================================================
-      # SHOW OUTPUT
-      # ======================================================
-
-      - name: Output statistics
+      - name: Create metadata
+        env:
+          OUTPUT_FILE: ${{ inputs.output_file }}
+          SOURCE_ARTIFACT: ${{ inputs.artifact_id }}
+          SOURCE_RECORDS: ${{ needs.prepare.outputs.source_records }}
+          WORKERS: ${{ inputs.workers }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo
-          echo "Output files:"
-          ls -lh output/
+          SHA="$(
+            sha256sum \
+              "final/$OUTPUT_FILE" \
+              | awk '{print $1}'
+          )"
 
-          echo
-          echo "Summary:"
-          cat output/encryption-summary.json
+          SIZE="$(
+            stat -c '%s' \
+              "final/$OUTPUT_FILE"
+          )"
 
-          echo
-          echo "SHA256:"
-          sha256sum \
-            "output/$OUTPUT_FILE"
+          cat > final/indexed-encryption-summary.json <<JSON
+          {
+            "format": "indexed-value-encryption-v1",
+            "source_artifact_id": "$SOURCE_ARTIFACT",
+            "source_records": $SOURCE_RECORDS,
+            "workers": $WORKERS,
+            "algorithm": "AES-256-GCM",
+            "nonce_bytes": 12,
+            "aad": "plaintext JSON key",
+            "kdf": "HMAC-SHA256 domain-separated v1",
+            "value_format": "v1:type:nonce:ciphertext:tag",
+            "output_file": "$OUTPUT_FILE",
+            "output_bytes": $SIZE,
+            "output_sha256": "$SHA",
+            "full_cryptographic_verification": true
+          }
+          JSON
 
-      # ======================================================
-      # UPLOAD DERIVATIVE
-      #
-      # Canonical artifact remains untouched.
-      # ======================================================
+          cat \
+            final/indexed-encryption-summary.json
 
-      - name: Upload indexed encrypted artifact
+      - name: Upload final indexed encrypted map
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.output_artifact }}
           path: |
-            output/${{ inputs.output_file }}
-            output/encryption-summary.json
+            final/${{ inputs.output_file }}
+            final/indexed-encryption-summary.json
           if-no-files-found: error
           retention-days: 90
