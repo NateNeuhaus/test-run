@@ -13,46 +13,128 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Download canonical encrypted ID map
-        uses: actions/download-artifact@v4
-        with:
-          artifact-ids: 9899370888
-          path: source-artifact
+      # ============================================================
+      # DOWNLOAD OLD CANONICAL ARTIFACT DIRECTLY BY ARTIFACT ID
+      #
+      # IMPORTANT:
+      # Do NOT use actions/download-artifact here.
+      # Artifact 9899370888 belongs to an older workflow run.
+      # ============================================================
 
-      - name: Decrypt and extract canonical ID map
+      - name: Download canonical artifact directly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p source-artifact
+
+          echo "Downloading artifact 9899370888 directly..."
+
+          curl \
+            --fail \
+            --location \
+            --show-error \
+            --silent \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/NateNeuhaus/test-run/actions/artifacts/9899370888/zip" \
+            -o source-artifact/artifact.zip
+
+          test -s source-artifact/artifact.zip
+
+          echo "Artifact downloaded:"
+          ls -lh source-artifact/artifact.zip
+
+          unzip -q source-artifact/artifact.zip \
+            -d source-artifact/unpacked
+
+          echo "Artifact contents:"
+          find source-artifact/unpacked -type f -maxdepth 3 -print
+
+
+      # ============================================================
+      # DECRYPT CANONICAL ID MAP
+      # ============================================================
+
+      - name: Decrypt canonical ID map
         env:
           CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ENC="$(find source-artifact -type f -name '*.enc' -print -quit)"
+          ENC="$(
+            find source-artifact/unpacked \
+              -type f \
+              -name '*.enc' \
+              -print \
+              -quit
+          )"
+
           if [[ -z "$ENC" ]]; then
-            echo "No encrypted payload found in artifact 9899370888." >&2
-            find source-artifact -maxdepth 3 -type f -print
+            echo "ERROR: encrypted payload not found"
+            find source-artifact/unpacked -type f -print
             exit 1
           fi
 
           mkdir -p work/extracted
 
-          openssl enc -d -aes-256-cbc \
-            -pbkdf2 -iter 200000 -md sha256 \
+          echo "Decrypting:"
+          echo "$ENC"
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
             -pass env:CITY_DATA_KEY \
             -in "$ENC" \
             -out work/ID-MAP-V1.zip
 
-          unzip -q work/ID-MAP-V1.zip -d work/extracted
+          unzip -q \
+            work/ID-MAP-V1.zip \
+            -d work/extracted
 
-          MAP="$(find work/extracted -type f -name 'id-map.json' -print -quit)"
+          MAP="$(
+            find work/extracted \
+              -type f \
+              -name 'id-map.json' \
+              -print \
+              -quit
+          )"
+
           if [[ -z "$MAP" ]]; then
-            echo "id-map.json not found after decryption." >&2
-            find work/extracted -maxdepth 3 -type f -print
+            echo "ERROR: id-map.json not found"
+            find work/extracted -type f -print
             exit 1
           fi
 
           cp "$MAP" work/id-map.json
 
-      - name: Build prefix registry files
+          echo "Canonical ID map:"
+          ls -lh work/id-map.json
+
+
+      # ============================================================
+      # CONVERT
+      #
+      # 0001-000001 -> 0001.json
+      # 0001-000002 -> 0001.json
+      # 0002-000001 -> 0002.json
+      #
+      # 0001.json:
+      #
+      # {
+      #   "0001-000001": "Business One",
+      #   "0001-000002": "Business Two"
+      # }
+      # ============================================================
+
+      - name: Build ID registry
         shell: bash
         run: |
           set -euo pipefail
@@ -62,169 +144,278 @@ jobs:
           const path = require("path");
           const crypto = require("crypto");
 
-          const input = "work/id-map.json";
-          const outputDir = "work/id-to-name";
+          const INPUT = "work/id-map.json";
+          const OUTPUT = "work/id-to-name";
 
-          const raw = fs.readFileSync(input, "utf8");
-          const map = JSON.parse(raw);
+          const raw = fs.readFileSync(INPUT, "utf8");
+          const source = JSON.parse(raw);
 
-          if (!map || Array.isArray(map) || typeof map !== "object") {
+          if (
+            source === null ||
+            Array.isArray(source) ||
+            typeof source !== "object"
+          ) {
             throw new Error("id-map.json root must be an object");
           }
 
-          fs.rmSync(outputDir, { recursive: true, force: true });
-          fs.mkdirSync(outputDir, { recursive: true });
+          fs.rmSync(OUTPUT, {
+            recursive: true,
+            force: true
+          });
+
+          fs.mkdirSync(OUTPUT, {
+            recursive: true
+          });
 
           const groups = Object.create(null);
+
           let sourceCount = 0;
 
-          for (const [id, name] of Object.entries(map)) {
+          for (const [id, name] of Object.entries(source)) {
+
             if (!/^\d{4}-\d{6}$/.test(id)) {
-              throw new Error(`Invalid ID: ${id}`);
+              throw new Error(
+                `INVALID ID: ${id}`
+              );
             }
 
             if (typeof name !== "string") {
-              throw new Error(`Non-string business name at ${id}`);
+              throw new Error(
+                `INVALID BUSINESS NAME TYPE: ${id}`
+              );
             }
 
             const prefix = id.slice(0, 4);
 
-            if (!groups[prefix]) groups[prefix] = Object.create(null);
+            if (!groups[prefix]) {
+              groups[prefix] = Object.create(null);
+            }
 
-            if (Object.prototype.hasOwnProperty.call(groups[prefix], id)) {
-              throw new Error(`Duplicate ID: ${id}`);
+            if (
+              Object.prototype.hasOwnProperty.call(
+                groups[prefix],
+                id
+              )
+            ) {
+              throw new Error(
+                `DUPLICATE ID: ${id}`
+              );
             }
 
             groups[prefix][id] = name;
+
             sourceCount++;
           }
 
-          const prefixes = Object.keys(groups).sort();
-          let writtenCount = 0;
+          const prefixes =
+            Object.keys(groups).sort();
+
+          let outputCount = 0;
 
           for (const prefix of prefixes) {
-            const filename = path.join(outputDir, `${prefix}.json`);
+
             const group = groups[prefix];
 
-            for (const id of Object.keys(group)) {
+            const file =
+              path.join(
+                OUTPUT,
+                `${prefix}.json`
+              );
+
+            const ids = Object.keys(group);
+
+            for (const id of ids) {
+
               if (id.slice(0, 4) !== prefix) {
-                throw new Error(`Prefix mismatch: ${id} in ${prefix}.json`);
+                throw new Error(
+                  `PREFIX ERROR: ${id}`
+                );
               }
+
             }
 
-            writtenCount += Object.keys(group).length;
-            fs.writeFileSync(filename, JSON.stringify(group, null, 2) + "\n");
+            outputCount += ids.length;
+
+            fs.writeFileSync(
+              file,
+              JSON.stringify(
+                group,
+                null,
+                2
+              ) + "\n"
+            );
           }
 
-          if (writtenCount !== sourceCount) {
+          if (outputCount !== sourceCount) {
             throw new Error(
-              `Count mismatch: source=${sourceCount}, output=${writtenCount}`
+              `COUNT MISMATCH source=${sourceCount} output=${outputCount}`
             );
           }
 
-          // Full round-trip verification against every source entry.
-          let verifiedCount = 0;
 
-          for (const prefix of prefixes) {
-            const group = JSON.parse(
-              fs.readFileSync(path.join(outputDir, `${prefix}.json`), "utf8")
-            );
+          // ========================================================
+          // FULL SECOND-PASS VERIFICATION
+          // ========================================================
 
-            for (const [id, name] of Object.entries(group)) {
-              if (!Object.prototype.hasOwnProperty.call(map, id)) {
-                throw new Error(`Extra output ID: ${id}`);
-              }
-              if (map[id] !== name) {
-                throw new Error(`Value mismatch: ${id}`);
-              }
-              verifiedCount++;
-            }
-          }
+          let verified = 0;
 
-          if (verifiedCount !== sourceCount) {
-            throw new Error(
-              `Verification mismatch: source=${sourceCount}, verified=${verifiedCount}`
-            );
-          }
-
-          const summary = {
-            format: "id-to-name-prefix-registry-v1",
-            source_artifact_id: 9899370888,
-            source_records: sourceCount,
-            output_records: writtenCount,
-            verified_records: verifiedCount,
-            output_files: prefixes.length,
-            prefixes,
-            source_sha256: crypto.createHash("sha256").update(raw).digest("hex"),
-            verified: true
-          };
-
-          fs.writeFileSync(
-            "work/id-to-name-summary.json",
-            JSON.stringify(summary, null, 2) + "\n"
-          );
-
-          console.log(JSON.stringify(summary, null, 2));
-          NODE
-
-      - name: Verify generated registry independently
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          node <<'NODE'
-          const fs = require("fs");
-          const path = require("path");
-
-          const source = JSON.parse(fs.readFileSync("work/id-map.json", "utf8"));
-          const dir = "work/id-to-name";
-          const files = fs.readdirSync(dir)
-            .filter(x => /^\d{4}\.json$/.test(x))
-            .sort();
-
-          let count = 0;
           const seen = new Set();
 
-          for (const file of files) {
-            const prefix = file.slice(0, 4);
-            const data = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+          for (const prefix of prefixes) {
 
-            if (!data || Array.isArray(data) || typeof data !== "object") {
-              throw new Error(`Bad root object: ${file}`);
-            }
+            const file =
+              path.join(
+                OUTPUT,
+                `${prefix}.json`
+              );
 
-            for (const [id, name] of Object.entries(data)) {
-              if (id.slice(0, 4) !== prefix) {
-                throw new Error(`Wrong file for ${id}: ${file}`);
-              }
+            const group =
+              JSON.parse(
+                fs.readFileSync(
+                  file,
+                  "utf8"
+                )
+              );
+
+            for (
+              const [id, name]
+              of Object.entries(group)
+            ) {
+
               if (seen.has(id)) {
-                throw new Error(`Duplicate output ID: ${id}`);
-              }
-              if (!Object.prototype.hasOwnProperty.call(source, id)) {
-                throw new Error(`Output contains unknown ID: ${id}`);
-              }
-              if (source[id] !== name) {
-                throw new Error(`Business name changed for ${id}`);
+                throw new Error(
+                  `DUPLICATE OUTPUT ID: ${id}`
+                );
               }
 
               seen.add(id);
-              count++;
+
+              if (
+                !Object.prototype.hasOwnProperty.call(
+                  source,
+                  id
+                )
+              ) {
+                throw new Error(
+                  `EXTRA OUTPUT ID: ${id}`
+                );
+              }
+
+              if (source[id] !== name) {
+                throw new Error(
+                  `NAME CHANGED: ${id}`
+                );
+              }
+
+              if (
+                id.slice(0, 4)
+                !== prefix
+              ) {
+                throw new Error(
+                  `WRONG OUTPUT FILE: ${id}`
+                );
+              }
+
+              verified++;
             }
           }
 
-          const sourceCount = Object.keys(source).length;
 
-          if (count !== sourceCount || seen.size !== sourceCount) {
+          if (
+            verified !== sourceCount ||
+            seen.size !== sourceCount
+          ) {
             throw new Error(
-              `Registry incomplete: source=${sourceCount}, output=${count}, unique=${seen.size}`
+              `VERIFICATION FAILURE source=${sourceCount} verified=${verified}`
             );
           }
 
-          console.log(`VERIFIED: ${count.toLocaleString()} exact ID → name records`);
-          console.log(`FILES: ${files.length}`);
+
+          const summary = {
+
+            format:
+              "id-to-name-prefix-registry-v1",
+
+            source_artifact_id:
+              9899370888,
+
+            source_records:
+              sourceCount,
+
+            output_records:
+              outputCount,
+
+            verified_records:
+              verified,
+
+            output_files:
+              prefixes.length,
+
+            source_sha256:
+              crypto
+                .createHash("sha256")
+                .update(raw)
+                .digest("hex"),
+
+            verified:
+              true
+          };
+
+
+          fs.writeFileSync(
+            "work/id-to-name-summary.json",
+            JSON.stringify(
+              summary,
+              null,
+              2
+            ) + "\n"
+          );
+
+
+          console.log("");
+          console.log(
+            "========================================"
+          );
+
+          console.log(
+            " ID -> NAME REGISTRY VERIFIED"
+          );
+
+          console.log(
+            "========================================"
+          );
+
+          console.log(
+            `Source records:   ${sourceCount.toLocaleString()}`
+          );
+
+          console.log(
+            `Output records:   ${outputCount.toLocaleString()}`
+          );
+
+          console.log(
+            `Verified records: ${verified.toLocaleString()}`
+          );
+
+          console.log(
+            `Registry files:   ${prefixes.length}`
+          );
+
+          console.log(
+            "Exact match:      YES"
+          );
+
+          console.log(
+            "========================================"
+          );
           NODE
 
-      - name: Publish to contractor-wiki-data
+
+      # ============================================================
+      # CLONE DESTINATION
+      # ============================================================
+
+      - name: Clone contractor-wiki-data
         env:
           TARGET_TOKEN: ${{ secrets.CONTRACTOR_WIKI_DATA }}
         shell: bash
@@ -232,40 +423,100 @@ jobs:
           set -euo pipefail
 
           if [[ -z "${TARGET_TOKEN:-}" ]]; then
-            echo "Missing CONTRACTOR_WIKI_DATA secret." >&2
+            echo "ERROR: CONTRACTOR_WIKI_DATA secret missing"
             exit 1
           fi
 
-          AUTH="$(printf 'x-access-token:%s' "$TARGET_TOKEN" | base64 -w0)"
+          AUTH="$(
+            printf 'x-access-token:%s' "$TARGET_TOKEN" |
+            base64 -w0
+          )"
 
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
-            clone --depth 1 \
+          git \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            clone \
+            --depth 1 \
             "https://github.com/NateNeuhaus/contractor-wiki-data.git" \
             target
 
+
+      # ============================================================
+      # COPY REGISTRY
+      # ============================================================
+
+      - name: Install registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
           rm -rf target/id-to-name
+
           mkdir -p target/id-to-name
 
-          cp work/id-to-name/*.json target/id-to-name/
-          cp work/id-to-name-summary.json target/id-to-name/_summary.json
+          cp \
+            work/id-to-name/*.json \
+            target/id-to-name/
+
+          cp \
+            work/id-to-name-summary.json \
+            target/id-to-name/_summary.json
+
+          echo "Files ready:"
+          find target/id-to-name \
+            -maxdepth 1 \
+            -type f |
+            wc -l
+
+
+      # ============================================================
+      # COMMIT + PUSH
+      # ============================================================
+
+      - name: Push registry
+        env:
+          TARGET_TOKEN: ${{ secrets.CONTRACTOR_WIKI_DATA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AUTH="$(
+            printf 'x-access-token:%s' "$TARGET_TOKEN" |
+            base64 -w0
+          )"
 
           cd target
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add --all id-to-name
 
           if git diff --cached --quiet; then
-            echo "Registry already matches source. Nothing to commit."
+
+            echo "Registry already current."
+
             exit 0
+
           fi
 
-          git commit -m "Publish ID to business-name registry"
+          git commit \
+            -m "Publish ID to business-name registry"
 
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
-            push origin HEAD:main
+          git \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            push \
+            origin \
+            HEAD:main
 
-          echo "PUBLISHED"
-          echo "Repository: NateNeuhaus/contractor-wiki-data"
-          echo "Directory: id-to-name/"
+          echo ""
+          echo "========================================"
+          echo " PUBLISHED"
+          echo "========================================"
+          echo "Repo: NateNeuhaus/contractor-wiki-data"
+          echo "Path: id-to-name/"
+          echo "========================================"
