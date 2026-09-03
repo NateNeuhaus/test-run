@@ -1,0 +1,707 @@
+name: Create ID Map
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-id-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare directories
+        run: |
+          mkdir -p source-chunks
+          mkdir -p source-json
+          mkdir -p output
+
+      # ======================================================
+      # FIND RELEASE ASSETS
+      # ======================================================
+
+      - name: Find encrypted source chunks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/city-data-v1" \
+            > release.json
+
+          python3 <<'PY'
+          import json
+
+          with open("release.json", "r", encoding="utf-8") as f:
+              release = json.load(f)
+
+          assets = []
+
+          for asset in release.get("assets", []):
+              name = asset.get("name", "")
+
+              if name.endswith(".enc"):
+                  assets.append({
+                      "name": name,
+                      "url": asset["url"]
+                  })
+
+          assets.sort(key=lambda x: x["name"])
+
+          if len(assets) != 16:
+              raise SystemExit(
+                  f"Expected 16 encrypted chunks, found {len(assets)}"
+              )
+
+          with open("assets.json", "w", encoding="utf-8") as f:
+              json.dump(assets, f, indent=2)
+
+          print("Found encrypted chunks:")
+
+          for asset in assets:
+              print(" ", asset["name"])
+          PY
+
+      # ======================================================
+      # DOWNLOAD
+      # ======================================================
+
+      - name: Download encrypted source chunks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          token = os.environ["GH_TOKEN"]
+
+          with open("assets.json", "r", encoding="utf-8") as f:
+              assets = json.load(f)
+
+          for index, asset in enumerate(assets, 1):
+
+              name = asset["name"]
+              url = asset["url"]
+
+              destination = os.path.join(
+                  "source-chunks",
+                  name
+              )
+
+              print(
+                  f"[{index}/{len(assets)}] "
+                  f"Downloading {name}"
+              )
+
+              subprocess.run([
+                  "curl",
+                  "-fL",
+                  "-H",
+                  f"Authorization: Bearer {token}",
+                  "-H",
+                  "Accept: application/octet-stream",
+                  url,
+                  "-o",
+                  destination
+              ], check=True)
+          PY
+
+      # ======================================================
+      # DECRYPT
+      # ======================================================
+
+      - name: Decrypt and extract source chunks
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CITY_DATA_KEY:-}" ]]; then
+            echo "ERROR: CITY_DATA_KEY secret missing."
+            exit 1
+          fi
+
+          count=0
+
+          for encrypted in source-chunks/*.enc
+          do
+            count=$((count + 1))
+
+            filename="$(basename "$encrypted")"
+
+            decrypted="/tmp/${filename%.enc}"
+
+            echo
+            echo "[$count/16] Decrypting:"
+            echo "$filename"
+
+            openssl enc \
+              -d \
+              -aes-256-cbc \
+              -pbkdf2 \
+              -iter 200000 \
+              -md sha256 \
+              -in "$encrypted" \
+              -out "$decrypted" \
+              -pass env:CITY_DATA_KEY
+
+            echo "Extracting..."
+
+            tar \
+              -xzf "$decrypted" \
+              -C source-json
+
+            rm -f "$decrypted"
+          done
+
+          echo
+          echo "Recovered JSON files:"
+
+          find source-json \
+            -type f \
+            -iname '*.json' \
+            | wc -l
+
+      # ======================================================
+      # BUILD ID MAP
+      # ======================================================
+
+      - name: Build ID map
+        run: |
+
+          cat > /tmp/create-id-map.js <<'NODE'
+
+          const fs = require("fs");
+          const path = require("path");
+
+          const ROOT =
+            path.resolve("source-json");
+
+          const OUTPUT =
+            path.resolve("output/id-map.json");
+
+          const SUMMARY =
+            path.resolve("output/id-map-summary.json");
+
+          // --------------------------------------------------
+          // recursively find JSON files
+          // --------------------------------------------------
+
+          function walk(dir) {
+
+            const files = [];
+
+            for (
+              const entry of
+              fs.readdirSync(dir, { withFileTypes: true })
+            ) {
+
+              const full =
+                path.join(dir, entry.name);
+
+              if (entry.isDirectory()) {
+
+                files.push(...walk(full));
+
+              } else if (
+                entry.isFile() &&
+                entry.name.toLowerCase().endsWith(".json")
+              ) {
+
+                files.push(full);
+
+              }
+
+            }
+
+            return files;
+          }
+
+          // --------------------------------------------------
+          // normalize column name
+          // --------------------------------------------------
+
+          function normalizeKey(value) {
+
+            return String(value ?? "")
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "");
+
+          }
+
+          // --------------------------------------------------
+          // recognized business-name fields
+          // --------------------------------------------------
+
+          const NAME_KEYS = new Set([
+            "name",
+            "businessname",
+            "companyname",
+            "company",
+            "business",
+            "title"
+          ]);
+
+          // --------------------------------------------------
+          // extract business name
+          // --------------------------------------------------
+
+          function extractName(row) {
+
+            if (
+              !row ||
+              typeof row !== "object" ||
+              Array.isArray(row)
+            ) {
+              return null;
+            }
+
+            for (
+              const [key, value]
+              of Object.entries(row)
+            ) {
+
+              if (
+                !NAME_KEYS.has(
+                  normalizeKey(key)
+                )
+              ) {
+                continue;
+              }
+
+              if (
+                typeof value === "string" &&
+                value.trim()
+              ) {
+
+                return value.trim();
+
+              }
+
+            }
+
+            return null;
+          }
+
+          // --------------------------------------------------
+          // convert supported JSON structures to records
+          // --------------------------------------------------
+
+          function rowsFromJson(data) {
+
+            // ----------------------------------------------
+            // ARRAY
+            // ----------------------------------------------
+
+            if (Array.isArray(data)) {
+
+              // Matrix:
+              //
+              // [
+              //   ["Name","City"],
+              //   ["ABC","Denver"]
+              // ]
+
+              if (
+                data.length >= 2 &&
+                Array.isArray(data[0])
+              ) {
+
+                const headers =
+                  data[0].map(
+                    value =>
+                      String(value ?? "")
+                  );
+
+                return data
+                  .slice(1)
+                  .map(values => {
+
+                    if (!Array.isArray(values)) {
+                      return values;
+                    }
+
+                    const row = {};
+
+                    for (
+                      let i = 0;
+                      i < headers.length;
+                      i++
+                    ) {
+
+                      row[headers[i]] =
+                        values[i];
+
+                    }
+
+                    return row;
+
+                  });
+
+              }
+
+              return data;
+
+            }
+
+            // ----------------------------------------------
+            // OBJECT
+            // ----------------------------------------------
+
+            if (
+              data &&
+              typeof data === "object"
+            ) {
+
+              const possibleContainers = [
+                "rows",
+                "data",
+                "records",
+                "results",
+                "items",
+                "businesses"
+              ];
+
+              for (
+                const key
+                of possibleContainers
+              ) {
+
+                if (
+                  Array.isArray(data[key])
+                ) {
+
+                  return rowsFromJson(
+                    data[key]
+                  );
+
+                }
+
+              }
+
+              // Object record map
+
+              const values =
+                Object.values(data);
+
+              if (
+                values.length > 0 &&
+                values.every(value =>
+                  value &&
+                  typeof value === "object" &&
+                  !Array.isArray(value)
+                )
+              ) {
+
+                return values;
+
+              }
+
+            }
+
+            return [];
+          }
+
+          // --------------------------------------------------
+          // source files
+          // --------------------------------------------------
+
+          const files =
+            walk(ROOT)
+              .sort((a, b) => {
+
+                const A =
+                  path.basename(a);
+
+                const B =
+                  path.basename(b);
+
+                return A.localeCompare(B);
+
+              });
+
+          if (!files.length) {
+
+            throw new Error(
+              "No source JSON files found."
+            );
+
+          }
+
+          console.log("");
+          console.log(
+            `Source files: ${files.length}`
+          );
+          console.log("");
+
+          // --------------------------------------------------
+          // output
+          // --------------------------------------------------
+
+          const idMap = {};
+
+          let totalRows = 0;
+          let namedRows = 0;
+          let unnamedRows = 0;
+
+          const fileSummary = [];
+
+          // --------------------------------------------------
+          // process files
+          // --------------------------------------------------
+
+          for (
+            let fileIndex = 0;
+            fileIndex < files.length;
+            fileIndex++
+          ) {
+
+            const file =
+              files[fileIndex];
+
+            const fileId =
+              String(fileIndex + 1)
+                .padStart(4, "0");
+
+            console.log(
+              `[${fileId}] ` +
+              path.basename(file)
+            );
+
+            const raw =
+              fs.readFileSync(
+                file,
+                "utf8"
+              );
+
+            const data =
+              JSON.parse(raw);
+
+            const rows =
+              rowsFromJson(data);
+
+            let fileNamed = 0;
+            let fileUnnamed = 0;
+
+            // ----------------------------------------------
+            // rows
+            // ----------------------------------------------
+
+            for (
+              let rowIndex = 0;
+              rowIndex < rows.length;
+              rowIndex++
+            ) {
+
+              const rowId =
+                String(rowIndex + 1)
+                  .padStart(6, "0");
+
+              const id =
+                `${fileId}-${rowId}`;
+
+              const name =
+                extractName(
+                  rows[rowIndex]
+                );
+
+              totalRows++;
+
+              if (name) {
+
+                idMap[id] = name;
+
+                namedRows++;
+                fileNamed++;
+
+              } else {
+
+                unnamedRows++;
+                fileUnnamed++;
+
+              }
+
+            }
+
+            fileSummary.push({
+              file_id: fileId,
+              filename:
+                path.basename(file),
+              rows:
+                rows.length,
+              named:
+                fileNamed,
+              unnamed:
+                fileUnnamed
+            });
+
+          }
+
+          // --------------------------------------------------
+          // save
+          // --------------------------------------------------
+
+          fs.writeFileSync(
+            OUTPUT,
+            JSON.stringify(
+              idMap,
+              null,
+              2
+            )
+          );
+
+          fs.writeFileSync(
+            SUMMARY,
+            JSON.stringify(
+              {
+                source_files:
+                  files.length,
+
+                total_rows:
+                  totalRows,
+
+                mapped_ids:
+                  namedRows,
+
+                unnamed_rows:
+                  unnamedRows,
+
+                id_format:
+                  "FFFF-RRRRRR",
+
+                files:
+                  fileSummary
+              },
+              null,
+              2
+            )
+          );
+
+          // --------------------------------------------------
+          // report
+          // --------------------------------------------------
+
+          console.log("");
+          console.log(
+            "=========================================="
+          );
+
+          console.log(
+            "ID MAP COMPLETE"
+          );
+
+          console.log(
+            "=========================================="
+          );
+
+          console.log(
+            `Source files : ${files.length}`
+          );
+
+          console.log(
+            `Total rows   : ${totalRows}`
+          );
+
+          console.log(
+            `Mapped IDs   : ${namedRows}`
+          );
+
+          console.log(
+            `No name      : ${unnamedRows}`
+          );
+
+          console.log("");
+          console.log(
+            `Output: ${OUTPUT}`
+          );
+
+          NODE
+
+          node --check /tmp/create-id-map.js
+
+          node /tmp/create-id-map.js
+
+      # ======================================================
+      # VERIFY
+      # ======================================================
+
+      - name: Verify ID map
+        run: |
+
+          python3 <<'PY'
+
+          import json
+          import re
+
+          with open(
+              "output/id-map.json",
+              "r",
+              encoding="utf-8"
+          ) as f:
+
+              data = json.load(f)
+
+          pattern = re.compile(
+              r"^\d{4}-\d{6}$"
+          )
+
+          invalid = [
+              key
+              for key in data
+              if not pattern.match(key)
+          ]
+
+          if invalid:
+
+              raise SystemExit(
+                  "Invalid IDs found: "
+                  + repr(invalid[:20])
+              )
+
+          if not data:
+
+              raise SystemExit(
+                  "ID map is empty."
+              )
+
+          print(
+              "ID map entries:",
+              len(data)
+          )
+
+          print("")
+          print("First 10:")
+
+          for key in list(data)[:10]:
+
+              print(
+                  key,
+                  "=>",
+                  data[key]
+              )
+
+          PY
+
+      # ======================================================
+      # ARTIFACT
+      # ======================================================
+
+      - name: Upload ID map artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: id-map
+          path: |
+            output/id-map.json
+            output/id-map-summary.json
+          if-no-files-found: error
+          retention-days: 90
