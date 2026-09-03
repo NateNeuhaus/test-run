@@ -4,49 +4,90 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run validation first; use full only after validation passes"
+        description: "Run mode"
         required: true
         default: validate
         type: choice
-        options: [validate, full]
+        options: [validate, full, retry, merge]
+
+      retry_source_run:
+        description: "Previous full run ID whose successful artifacts should be reused"
+        required: false
+        default: "33759387965"
+        type: string
+
+      retry_run_id:
+        description: "Retry run ID containing successful retry artifacts (00,04,08,10,14)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 env:
   RELEASE_BASE: https://github.com/NateNeuhaus/test-run/releases/download/city-data-v1
 
 jobs:
+
+  # ============================================================
+  # VALIDATION
+  # ============================================================
+
   validate:
     if: ${{ inputs.mode == 'validate' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     strategy:
       fail-fast: false
       matrix:
         chunk: ["00", "05", "10", "15"]
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Prepare
         run: |
           set -euo pipefail
+
           cp map-name-to-city-fixed resolver
+
           python3 - <<'PY'
           from pathlib import Path
-          p=Path("resolver"); s=p.read_text()
-          replacements={
-            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':'process.env.JSON_DIR',
-            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':'process.env.CITIES_CSV',
-            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':'process.env.ZIP_FILE',
-            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':'process.env.OUTPUT',
-            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':'process.env.DIAGNOSTICS',
-            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':'process.env.CHECKPOINT'
+
+          p = Path("resolver")
+          s = p.read_text()
+
+          replacements = {
+            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':
+              'process.env.JSON_DIR',
+
+            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':
+              'process.env.CITIES_CSV',
+
+            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':
+              'process.env.ZIP_FILE',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':
+              'process.env.OUTPUT',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':
+              'process.env.DIAGNOSTICS',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':
+              'process.env.CHECKPOINT'
           }
-          for a,b in replacements.items(): s=s.replace(a,b)
+
+          for a, b in replacements.items():
+              s = s.replace(a, b)
+
           p.write_text(s)
           PY
+
           node --check resolver
+
           mkdir -p json out
 
       - name: Download and decrypt
@@ -54,43 +95,142 @@ jobs:
           CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
         run: |
           set -euo pipefail
+
           test -n "$CITY_DATA_KEY"
-          curl -fL --retry 5 "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" -o chunk.enc
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
-            -in chunk.enc -out chunk.tar.gz -pass env:CITY_DATA_KEY
+
+          curl -fL --retry 5 \
+            "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" \
+            -o chunk.enc
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in chunk.enc \
+            -out chunk.tar.gz \
+            -pass env:CITY_DATA_KEY
+
           tar -xzf chunk.tar.gz -C json
+
           rm chunk.enc chunk.tar.gz
 
       - name: Normalize matrix sources and make sample
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
-          import json,pathlib,os,random
-          root=pathlib.Path("json")
+          import json
+          import pathlib
+          import os
+          import random
+
+          root = pathlib.Path("json")
+
           for p in root.glob("*.json"):
-              try: data=json.loads(p.read_text())
-              except Exception: continue
-              rows=data if isinstance(data,list) else (data.get("rows") if isinstance(data,dict) else None)
-              if rows and isinstance(rows,list) and isinstance(rows[0],list):
-                  h=[str(x or "").strip() or f"column_{i}" for i,x in enumerate(rows[0])]
-                  objs=[{h[i]:(r[i] if i<len(r) else None) for i in range(len(h))}
-                        for r in rows[1:] if isinstance(r,list)]
-                  tmp=p.with_suffix(".json.tmp"); tmp.write_text(json.dumps(objs,ensure_ascii=False)); os.replace(tmp,p)
+
+              try:
+                  data = json.loads(p.read_text())
+              except Exception:
+                  continue
+
+              rows = (
+                  data
+                  if isinstance(data, list)
+                  else (
+                      data.get("rows")
+                      if isinstance(data, dict)
+                      else None
+                  )
+              )
+
+              if (
+                  rows
+                  and isinstance(rows, list)
+                  and isinstance(rows[0], list)
+              ):
+
+                  h = [
+                      str(x or "").strip() or f"column_{i}"
+                      for i, x in enumerate(rows[0])
+                  ]
+
+                  objs = [
+                      {
+                          h[i]: (
+                              r[i]
+                              if i < len(r)
+                              else None
+                          )
+                          for i in range(len(h))
+                      }
+                      for r in rows[1:]
+                      if isinstance(r, list)
+                  ]
+
+                  tmp = p.with_suffix(".json.tmp")
+
+                  tmp.write_text(
+                      json.dumps(
+                          objs,
+                          ensure_ascii=False
+                      )
+                  )
+
+                  os.replace(tmp, p)
 
           random.seed(20260903)
-          dst=pathlib.Path("sample"); dst.mkdir()
-          files=list(root.glob("*.json")); random.shuffle(files)
-          total=0
+
+          dst = pathlib.Path("sample")
+          dst.mkdir()
+
+          files = list(root.glob("*.json"))
+          random.shuffle(files)
+
+          total = 0
+
           for p in files[:25]:
-              try: data=json.loads(p.read_text())
-              except Exception: continue
-              rows=data if isinstance(data,list) else (list(data.values()) if isinstance(data,dict) else [])
-              rows=[r for r in rows if isinstance(r,dict)]
-              if not rows: continue
-              take=random.sample(rows,min(100,len(rows)))
-              (dst/p.name).write_text(json.dumps(take,ensure_ascii=False))
-              total+=len(take)
-          print("Validation rows:",total)
+
+              try:
+                  data = json.loads(p.read_text())
+              except Exception:
+                  continue
+
+              rows = (
+                  data
+                  if isinstance(data, list)
+                  else (
+                      list(data.values())
+                      if isinstance(data, dict)
+                      else []
+                  )
+              )
+
+              rows = [
+                  r
+                  for r in rows
+                  if isinstance(r, dict)
+              ]
+
+              if not rows:
+                  continue
+
+              take = random.sample(
+                  rows,
+                  min(100, len(rows))
+              )
+
+              (dst / p.name).write_text(
+                  json.dumps(
+                      take,
+                      ensure_ascii=False
+                  )
+              )
+
+              total += len(take)
+
+          print("Validation rows:", total)
           PY
 
       - name: Resolve validation sample
@@ -104,58 +244,247 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=12000
         run: node resolver
 
-      - name: Check output
+      - name: Validate and repair validation output
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
-          import json,re,pathlib,collections
-          p=pathlib.Path("out/results.jsonl")
-          rows=[json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
-          counts=collections.Counter(r.get("status") for r in rows)
-          bad=[r for r in rows if r.get("city") and re.search(r"\d",str(r["city"]))]
-          print("Rows:",len(rows))
-          print("Status:",dict(counts))
-          print("Malformed city values:",len(bad))
-          for r in bad[:20]: print(json.dumps(r,ensure_ascii=False))
-          if bad: raise SystemExit("FAILED: malformed city values emitted")
+          import json
+          import re
+          import pathlib
+          import os
+          import collections
+
+          p = pathlib.Path("out/results.jsonl")
+
+          if not p.exists():
+              raise SystemExit(
+                  "FAILED: out/results.jsonl does not exist"
+              )
+
+          good = []
+          malformed = []
+          bad_city = []
+          counts = collections.Counter()
+
+          with p.open("rb") as f:
+
+              for lineno, raw in enumerate(f, 1):
+
+                  if not raw.strip():
+                      continue
+
+                  try:
+
+                      r = json.loads(
+                          raw.decode("utf-8")
+                      )
+
+                  except Exception as exc:
+
+                      malformed.append(
+                          (
+                              lineno,
+                              raw,
+                              exc
+                          )
+                      )
+
+                      continue
+
+                  if not raw.endswith(b"\n"):
+                      raw += b"\n"
+
+                  good.append(raw)
+
+                  counts[
+                      r.get("status", "unknown")
+                  ] += 1
+
+                  if (
+                      r.get("city")
+                      and re.search(
+                          r"\d",
+                          str(r["city"])
+                      )
+                  ):
+
+                      bad_city.append(r)
+
+          print(
+              "Valid JSONL records:",
+              len(good)
+          )
+
+          print(
+              "Status:",
+              dict(counts)
+          )
+
+          print(
+              "Malformed JSON records:",
+              len(malformed)
+          )
+
+          print(
+              "Malformed city values:",
+              len(bad_city)
+          )
+
+          if malformed:
+
+              q = pathlib.Path(
+                  "out/malformed-jsonl-records.txt"
+              )
+
+              with q.open("wb") as f:
+
+                  for lineno, raw, exc in malformed:
+
+                      f.write(
+                          (
+                              f"LINE {lineno}\n"
+                              f"ERROR: "
+                              f"{type(exc).__name__}: "
+                              f"{exc}\n"
+                              f"BYTES: {len(raw)}\n"
+                              f"CONTENT:\n"
+                          ).encode("utf-8")
+                      )
+
+                      f.write(raw[:10000])
+
+                      if not raw.endswith(b"\n"):
+                          f.write(b"\n")
+
+                      f.write(
+                          b"\n"
+                          b"------------------------"
+                          b"\n\n"
+                      )
+
+              tmp = pathlib.Path(
+                  "out/results.jsonl.repaired.tmp"
+              )
+
+              with tmp.open("wb") as f:
+
+                  for raw in good:
+                      f.write(raw)
+
+                  f.flush()
+                  os.fsync(f.fileno())
+
+              os.replace(tmp, p)
+
+              print(
+                  "Repaired results.jsonl; "
+                  "corrupt records quarantined:",
+                  len(malformed)
+              )
+
+          if bad_city:
+
+              for r in bad_city[:20]:
+                  print(
+                      json.dumps(
+                          r,
+                          ensure_ascii=False
+                      )
+                  )
+
+              raise SystemExit(
+                  "FAILED: malformed city values emitted"
+              )
+
+          print("Validation output usable.")
           PY
 
       - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: validation-${{ matrix.chunk }}
           path: out/
           retention-days: 7
 
+
+  # ============================================================
+  # FULL
+  # ============================================================
+
   full:
     if: ${{ inputs.mode == 'full' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     strategy:
       fail-fast: false
       max-parallel: 16
+
       matrix:
-        chunk: ["00","01","02","03","04","05","06","07","08","09","10","11","12","13","14","15"]
+        chunk:
+          [
+            "00",
+            "01",
+            "02",
+            "03",
+            "04",
+            "05",
+            "06",
+            "07",
+            "08",
+            "09",
+            "10",
+            "11",
+            "12",
+            "13",
+            "14",
+            "15"
+          ]
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Prepare
         run: |
           set -euo pipefail
+
           cp map-name-to-city-fixed resolver
+
           python3 - <<'PY'
           from pathlib import Path
-          p=Path("resolver"); s=p.read_text()
-          replacements={
-            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':'process.env.JSON_DIR',
-            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':'process.env.CITIES_CSV',
-            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':'process.env.ZIP_FILE',
-            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':'process.env.OUTPUT',
-            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':'process.env.DIAGNOSTICS',
-            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':'process.env.CHECKPOINT'
+
+          p = Path("resolver")
+          s = p.read_text()
+
+          replacements = {
+            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':
+              'process.env.JSON_DIR',
+
+            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':
+              'process.env.CITIES_CSV',
+
+            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':
+              'process.env.ZIP_FILE',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':
+              'process.env.OUTPUT',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':
+              'process.env.DIAGNOSTICS',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':
+              'process.env.CHECKPOINT'
           }
-          for a,b in replacements.items(): s=s.replace(a,b)
+
+          for a, b in replacements.items():
+              s = s.replace(a, b)
+
           p.write_text(s)
           PY
+
           node --check resolver
+
           mkdir -p json out
 
       - name: Download and decrypt
@@ -163,25 +492,93 @@ jobs:
           CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
         run: |
           set -euo pipefail
-          curl -fL --retry 5 "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" -o chunk.enc
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
-            -in chunk.enc -out chunk.tar.gz -pass env:CITY_DATA_KEY
+
+          test -n "$CITY_DATA_KEY"
+
+          curl -fL --retry 5 \
+            "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" \
+            -o chunk.enc
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in chunk.enc \
+            -out chunk.tar.gz \
+            -pass env:CITY_DATA_KEY
+
           tar -xzf chunk.tar.gz -C json
+
           rm chunk.enc chunk.tar.gz
 
       - name: Normalize matrix sources
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
-          import json,pathlib,os
+          import json
+          import pathlib
+          import os
+
           for p in pathlib.Path("json").glob("*.json"):
-              try: data=json.loads(p.read_text())
-              except Exception: continue
-              rows=data if isinstance(data,list) else (data.get("rows") if isinstance(data,dict) else None)
-              if rows and isinstance(rows,list) and isinstance(rows[0],list):
-                  h=[str(x or "").strip() or f"column_{i}" for i,x in enumerate(rows[0])]
-                  objs=[{h[i]:(r[i] if i<len(r) else None) for i in range(len(h))}
-                        for r in rows[1:] if isinstance(r,list)]
-                  tmp=p.with_suffix(".json.tmp"); tmp.write_text(json.dumps(objs,ensure_ascii=False)); os.replace(tmp,p)
+
+              try:
+                  data = json.loads(p.read_text())
+              except Exception:
+                  continue
+
+              rows = (
+                  data
+                  if isinstance(data, list)
+                  else (
+                      data.get("rows")
+                      if isinstance(data, dict)
+                      else None
+                  )
+              )
+
+              if (
+                  rows
+                  and isinstance(rows, list)
+                  and isinstance(rows[0], list)
+              ):
+
+                  h = [
+                      str(x or "").strip()
+                      or f"column_{i}"
+                      for i, x
+                      in enumerate(rows[0])
+                  ]
+
+                  objs = [
+                      {
+                          h[i]: (
+                              r[i]
+                              if i < len(r)
+                              else None
+                          )
+                          for i
+                          in range(len(h))
+                      }
+                      for r
+                      in rows[1:]
+                      if isinstance(r, list)
+                  ]
+
+                  tmp = p.with_suffix(
+                      ".json.tmp"
+                  )
+
+                  tmp.write_text(
+                      json.dumps(
+                          objs,
+                          ensure_ascii=False
+                      )
+                  )
+
+                  os.replace(tmp, p)
           PY
 
       - name: Resolve
@@ -195,58 +592,1042 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=12000
         run: node resolver
 
-      - name: Reject malformed city outputs
+      - name: Validate and repair output
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
-          import json,re,pathlib
-          bad=[]
-          for line in pathlib.Path("out/results.jsonl").read_text().splitlines():
-              if not line.strip(): continue
-              r=json.loads(line)
-              if r.get("city") and re.search(r"\d",str(r["city"])): bad.append(r)
-          print("Malformed city values:",len(bad))
-          if bad:
-              for r in bad[:20]: print(json.dumps(r,ensure_ascii=False))
-              raise SystemExit(1)
+          import json
+          import re
+          import pathlib
+          import os
+
+          p = pathlib.Path(
+              "out/results.jsonl"
+          )
+
+          if not p.exists():
+
+              raise SystemExit(
+                  "FAILED: out/results.jsonl "
+                  "does not exist"
+              )
+
+          good = []
+          malformed = []
+          bad_city = []
+
+          with p.open("rb") as f:
+
+              for lineno, raw in enumerate(
+                  f,
+                  1
+              ):
+
+                  if not raw.strip():
+                      continue
+
+                  try:
+
+                      r = json.loads(
+                          raw.decode("utf-8")
+                      )
+
+                  except Exception as exc:
+
+                      malformed.append(
+                          (
+                              lineno,
+                              raw,
+                              exc
+                          )
+                      )
+
+                      continue
+
+                  if not raw.endswith(b"\n"):
+                      raw += b"\n"
+
+                  good.append(raw)
+
+                  if (
+                      r.get("city")
+                      and re.search(
+                          r"\d",
+                          str(r["city"])
+                      )
+                  ):
+
+                      bad_city.append(r)
+
+          print(
+              "Valid JSONL records:",
+              len(good)
+          )
+
+          print(
+              "Malformed JSON records:",
+              len(malformed)
+          )
+
+          print(
+              "Malformed city values:",
+              len(bad_city)
+          )
+
+          if malformed:
+
+              q = pathlib.Path(
+                  "out/malformed-jsonl-records.txt"
+              )
+
+              with q.open("wb") as f:
+
+                  for (
+                      lineno,
+                      raw,
+                      exc
+                  ) in malformed:
+
+                      f.write(
+                          (
+                              f"LINE {lineno}\n"
+                              f"ERROR: "
+                              f"{type(exc).__name__}: "
+                              f"{exc}\n"
+                              f"BYTES: "
+                              f"{len(raw)}\n"
+                              f"CONTENT:\n"
+                          ).encode("utf-8")
+                      )
+
+                      f.write(
+                          raw[:10000]
+                      )
+
+                      if not raw.endswith(
+                          b"\n"
+                      ):
+
+                          f.write(b"\n")
+
+                      f.write(
+                          b"\n"
+                          b"------------------------"
+                          b"\n\n"
+                      )
+
+              tmp = pathlib.Path(
+                  "out/"
+                  "results.jsonl."
+                  "repaired.tmp"
+              )
+
+              with tmp.open("wb") as f:
+
+                  for raw in good:
+                      f.write(raw)
+
+                  f.flush()
+                  os.fsync(
+                      f.fileno()
+                  )
+
+              os.replace(
+                  tmp,
+                  p
+              )
+
+              print(
+                  "Repaired results.jsonl; "
+                  "corrupt records quarantined:",
+                  len(malformed)
+              )
+
+          if bad_city:
+
+              for r in bad_city[:20]:
+
+                  print(
+                      json.dumps(
+                          r,
+                          ensure_ascii=False
+                      )
+                  )
+
+              raise SystemExit(
+                  "FAILED: malformed city "
+                  "values emitted"
+              )
+
+          print("Output usable.")
           PY
 
       - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: city-results-${{ matrix.chunk }}
           path: out/
           retention-days: 7
 
-  merge:
-    if: ${{ inputs.mode == 'full' }}
-    needs: full
+
+  # ============================================================
+  # RETRY ONLY FAILED SHARDS
+  # ============================================================
+
+  retry:
+    if: ${{ inputs.mode == 'retry' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+
+      matrix:
+        chunk:
+          [
+            "00",
+            "04",
+            "08",
+            "10",
+            "14"
+          ]
+
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          set -euo pipefail
+
+          cp map-name-to-city-fixed resolver
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("resolver")
+          s = p.read_text()
+
+          replacements = {
+            '"/home/ideapad/Documents/Files/temp/count/clean-up/json"':
+              'process.env.JSON_DIR',
+
+            '"/home/ideapad/Documents/Files/temp/us-cities.csv"':
+              'process.env.CITIES_CSV',
+
+            '"/home/ideapad/Documents/Files/temp/zip-code-to-usa-city-stat.txt"':
+              'process.env.ZIP_FILE',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved.jsonl"':
+              'process.env.OUTPUT',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-diagnostics.jsonl"':
+              'process.env.DIAGNOSTICS',
+
+            '"/home/ideapad/Documents/Files/temp/count/name-to-city-resolved-checkpoint.json"':
+              'process.env.CHECKPOINT'
+          }
+
+          for a, b in replacements.items():
+              s = s.replace(a, b)
+
+          p.write_text(s)
+          PY
+
+          node --check resolver
+
+          mkdir -p json out
+
+      - name: Download and decrypt
+        env:
+          CITY_DATA_KEY: ${{ secrets.CITY_DATA_KEY }}
+        run: |
+          set -euo pipefail
+
+          test -n "$CITY_DATA_KEY"
+
+          curl -fL --retry 5 \
+            "$RELEASE_BASE/city-data-${{ matrix.chunk }}.tar.gz.enc" \
+            -o chunk.enc
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in chunk.enc \
+            -out chunk.tar.gz \
+            -pass env:CITY_DATA_KEY
+
+          tar -xzf chunk.tar.gz -C json
+
+          rm chunk.enc chunk.tar.gz
+
+      - name: Normalize matrix sources
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import os
+
+          for p in pathlib.Path(
+              "json"
+          ).glob("*.json"):
+
+              try:
+                  data = json.loads(
+                      p.read_text()
+                  )
+              except Exception:
+                  continue
+
+              rows = (
+                  data
+                  if isinstance(data, list)
+                  else (
+                      data.get("rows")
+                      if isinstance(data, dict)
+                      else None
+                  )
+              )
+
+              if (
+                  rows
+                  and isinstance(rows, list)
+                  and isinstance(
+                      rows[0],
+                      list
+                  )
+              ):
+
+                  h = [
+                      str(x or "").strip()
+                      or f"column_{i}"
+                      for i, x
+                      in enumerate(rows[0])
+                  ]
+
+                  objs = [
+                      {
+                          h[i]: (
+                              r[i]
+                              if i < len(r)
+                              else None
+                          )
+                          for i
+                          in range(len(h))
+                      }
+                      for r
+                      in rows[1:]
+                      if isinstance(r, list)
+                  ]
+
+                  tmp = p.with_suffix(
+                      ".json.tmp"
+                  )
+
+                  tmp.write_text(
+                      json.dumps(
+                          objs,
+                          ensure_ascii=False
+                      )
+                  )
+
+                  os.replace(
+                      tmp,
+                      p
+                  )
+          PY
+
+      - name: Resolve retry shard
+        env:
+          JSON_DIR: json
+          CITIES_CSV: us-cities.csv
+          ZIP_FILE: zip-code-to-usa-city-stat.txt
+          OUTPUT: out/results.jsonl
+          DIAGNOSTICS: out/diagnostics.jsonl
+          CHECKPOINT: out/checkpoint.json
+          NODE_OPTIONS: --max-old-space-size=12000
+        run: node resolver
+
+      - name: Validate and repair output
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import re
+          import pathlib
+          import os
+
+          p = pathlib.Path(
+              "out/results.jsonl"
+          )
+
+          if not p.exists():
+
+              raise SystemExit(
+                  "FAILED: "
+                  "out/results.jsonl "
+                  "does not exist"
+              )
+
+          good = []
+          malformed = []
+          bad_city = []
+
+          with p.open("rb") as f:
+
+              for lineno, raw in enumerate(
+                  f,
+                  1
+              ):
+
+                  if not raw.strip():
+                      continue
+
+                  try:
+
+                      r = json.loads(
+                          raw.decode("utf-8")
+                      )
+
+                  except Exception as exc:
+
+                      malformed.append(
+                          (
+                              lineno,
+                              raw,
+                              exc
+                          )
+                      )
+
+                      continue
+
+                  if not raw.endswith(b"\n"):
+                      raw += b"\n"
+
+                  good.append(raw)
+
+                  if (
+                      r.get("city")
+                      and re.search(
+                          r"\d",
+                          str(r["city"])
+                      )
+                  ):
+
+                      bad_city.append(r)
+
+          print(
+              "Valid JSONL records:",
+              len(good)
+          )
+
+          print(
+              "Malformed JSON records:",
+              len(malformed)
+          )
+
+          print(
+              "Malformed city values:",
+              len(bad_city)
+          )
+
+          if malformed:
+
+              q = pathlib.Path(
+                  "out/"
+                  "malformed-jsonl-records.txt"
+              )
+
+              with q.open("wb") as f:
+
+                  for (
+                      lineno,
+                      raw,
+                      exc
+                  ) in malformed:
+
+                      f.write(
+                          (
+                              f"LINE {lineno}\n"
+                              f"ERROR: "
+                              f"{type(exc).__name__}: "
+                              f"{exc}\n"
+                              f"BYTES: "
+                              f"{len(raw)}\n"
+                              f"CONTENT:\n"
+                          ).encode()
+                      )
+
+                      f.write(
+                          raw[:10000]
+                      )
+
+                      if not raw.endswith(
+                          b"\n"
+                      ):
+
+                          f.write(b"\n")
+
+                      f.write(
+                          b"\n"
+                          b"------------------------"
+                          b"\n\n"
+                      )
+
+              tmp = pathlib.Path(
+                  "out/"
+                  "results.jsonl."
+                  "repaired.tmp"
+              )
+
+              with tmp.open("wb") as f:
+
+                  for raw in good:
+                      f.write(raw)
+
+                  f.flush()
+
+                  os.fsync(
+                      f.fileno()
+                  )
+
+              os.replace(
+                  tmp,
+                  p
+              )
+
+              print(
+                  "Repaired results.jsonl; "
+                  "quarantined:",
+                  len(malformed)
+              )
+
+          if bad_city:
+
+              for r in bad_city[:20]:
+
+                  print(
+                      json.dumps(
+                          r,
+                          ensure_ascii=False
+                      )
+                  )
+
+              raise SystemExit(
+                  "FAILED: malformed city "
+                  "values emitted"
+              )
+
+          print("Output usable.")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: city-results-${{ matrix.chunk }}
+          path: out/
+          retention-days: 7
+
+
+  # ============================================================
+  # MERGE
+  #
+  # MODE=full:
+  #   merge the 16 artifacts produced by this run
+  #
+  # MODE=retry:
+  #   merge 5 retry artifacts from this run +
+  #   11 successful artifacts from old full run
+  #
+  # MODE=merge:
+  #   DO NOT rerun any city resolution
+  #   download 11 old full artifacts +
+  #   5 already-successful retry artifacts
+  # ============================================================
+
+  merge:
+    if: >-
+      ${{
+        always() &&
+        (
+          inputs.mode == 'full' ||
+          inputs.mode == 'retry' ||
+          inputs.mode == 'merge'
+        )
+      }}
+
+    needs:
+      - full
+      - retry
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+
+      # --------------------------------------------------------
+      # FULL MODE
+      # --------------------------------------------------------
+
+      - name: Download current full-run artifacts
+        if: ${{ inputs.mode == 'full' }}
+        uses: actions/download-artifact@v4
         with:
           pattern: city-results-*
-          path: shards
+          path: shards/full
+          merge-multiple: false
 
-      - name: Merge
+
+      # --------------------------------------------------------
+      # RETRY MODE
+      # --------------------------------------------------------
+
+      - name: Download current retry artifacts
+        if: ${{ inputs.mode == 'retry' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: city-results-*
+          path: shards/retry
+          merge-multiple: false
+
+
+      # --------------------------------------------------------
+      # PREVIOUS FULL RUN
+      #
+      # Native GitHub cross-run artifact download.
+      # No urllib.
+      # No manual redirect handling.
+      # --------------------------------------------------------
+
+      - name: Download successful artifacts from previous full run
+        if: >-
+          ${{
+            inputs.mode == 'retry' ||
+            inputs.mode == 'merge'
+          }}
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.retry_source_run }}
+          pattern: city-results-*
+          path: shards/previous-full
+          merge-multiple: false
+
+
+      # --------------------------------------------------------
+      # EXISTING RETRY RUN
+      #
+      # Used by MODE=merge.
+      # This avoids rerunning 00,04,08,10,14.
+      # --------------------------------------------------------
+
+      - name: Download completed artifacts from retry run
+        if: ${{ inputs.mode == 'merge' }}
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.retry_run_id }}
+          pattern: city-results-*
+          path: shards/retry
+          merge-multiple: false
+
+
+      # --------------------------------------------------------
+      # SELECT EXACTLY THE CORRECT 16
+      #
+      # Retry shards override failed old-full shards.
+      # --------------------------------------------------------
+
+      - name: Select exactly one artifact for each shard
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
-          import json,pathlib,collections
-          cities=collections.defaultdict(set); stats=collections.Counter()
-          for p in pathlib.Path("shards").rglob("results.jsonl"):
-              for line in p.read_text().splitlines():
-                  if not line.strip(): continue
-                  r=json.loads(line); stats[r.get("status","unknown")]+=1
-                  if r.get("name") and r.get("city"): cities[r["name"]].add(r["city"])
-          final={}; collisions={}
-          for name,vals in cities.items():
-              vals=sorted(vals)
-              final[name]=vals[0] if len(vals)==1 else vals
-              if len(vals)>1: collisions[name]=vals
-          pathlib.Path("name-to-city.json").write_text(json.dumps(final,ensure_ascii=False,indent=2)+"\n")
-          pathlib.Path("name-to-city-collisions.json").write_text(json.dumps(collisions,ensure_ascii=False,indent=2)+"\n")
-          summary={"status_counts":dict(stats),"unique_names":len(final),"name_collisions":len(collisions)}
-          pathlib.Path("merge-summary.json").write_text(json.dumps(summary,indent=2)+"\n")
-          print(json.dumps(summary,indent=2))
+          import pathlib
+          import shutil
+
+          mode = "${{ inputs.mode }}"
+
+          root = pathlib.Path(
+              "shards"
+          )
+
+          selected = pathlib.Path(
+              "selected-shards"
+          )
+
+          selected.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          expected = {
+              f"{i:02d}"
+              for i in range(16)
+          }
+
+          retry_chunks = {
+              "00",
+              "04",
+              "08",
+              "10",
+              "14"
+          }
+
+          def result(
+              base,
+              chunk
+          ):
+
+              p = (
+                  base
+                  / f"city-results-{chunk}"
+                  / "results.jsonl"
+              )
+
+              return (
+                  p
+                  if p.exists()
+                  else None
+              )
+
+          for chunk in sorted(expected):
+
+              if mode == "full":
+
+                  p = result(
+                      root / "full",
+                      chunk
+                  )
+
+                  source = "full"
+
+              elif chunk in retry_chunks:
+
+                  p = result(
+                      root / "retry",
+                      chunk
+                  )
+
+                  source = "retry"
+
+              else:
+
+                  p = result(
+                      root / "previous-full",
+                      chunk
+                  )
+
+                  source = "previous-full"
+
+              if not p:
+
+                  raise SystemExit(
+                      "FAILED: missing selected "
+                      f"shard {chunk} "
+                      f"from {source}"
+                  )
+
+              dst = (
+                  selected
+                  / f"city-results-{chunk}"
+              )
+
+              shutil.copytree(
+                  p.parent,
+                  dst,
+                  dirs_exist_ok=True
+              )
+
+              print(
+                  chunk,
+                  "<-",
+                  source,
+                  p
+              )
           PY
+
+
+      # --------------------------------------------------------
+      # VERIFY ALL 16
+      # --------------------------------------------------------
+
+      - name: Verify all 16 selected shards
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import pathlib
+
+          root = pathlib.Path(
+              "selected-shards"
+          )
+
+          missing = []
+
+          for i in range(16):
+
+              chunk = f"{i:02d}"
+
+              p = (
+                  root
+                  / f"city-results-{chunk}"
+                  / "results.jsonl"
+              )
+
+              if (
+                  not p.exists()
+                  or p.stat().st_size == 0
+              ):
+
+                  missing.append(
+                      chunk
+                  )
+
+                  print(
+                      chunk,
+                      "MISSING OR EMPTY"
+                  )
+
+              else:
+
+                  print(
+                      chunk,
+                      p.stat().st_size,
+                      "bytes"
+                  )
+
+          if missing:
+
+              raise SystemExit(
+                  "FAILED: missing/empty "
+                  "shards: "
+                  + ", ".join(missing)
+              )
+
+          print(
+              "All 16 selected shards "
+              "are present and non-empty."
+          )
+          PY
+
+
+      # --------------------------------------------------------
+      # MERGE
+      # --------------------------------------------------------
+
+      - name: Merge resiliently
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import collections
+
+          cities = collections.defaultdict(
+              set
+          )
+
+          stats = collections.Counter()
+
+          malformed = []
+
+          shard_counts = {}
+
+          files = sorted(
+              pathlib.Path(
+                  "selected-shards"
+              ).glob(
+                  "city-results-*/"
+                  "results.jsonl"
+              )
+          )
+
+          if len(files) != 16:
+
+              raise SystemExit(
+                  "FAILED: expected "
+                  "16 result files, "
+                  f"found {len(files)}"
+              )
+
+          for p in files:
+
+              chunk = p.parent.name[-2:]
+
+              count = 0
+
+              with p.open(
+                  encoding="utf-8",
+                  errors="replace"
+              ) as f:
+
+                  for lineno, line in enumerate(
+                      f,
+                      1
+                  ):
+
+                      if not line.strip():
+                          continue
+
+                      try:
+
+                          r = json.loads(
+                              line
+                          )
+
+                      except Exception as exc:
+
+                          malformed.append(
+                              {
+                                  "chunk": chunk,
+                                  "file": str(p),
+                                  "line": lineno,
+                                  "error": str(exc),
+                                  "content":
+                                      line[:2000]
+                              }
+                          )
+
+                          continue
+
+                      count += 1
+
+                      stats[
+                          r.get(
+                              "status",
+                              "unknown"
+                          )
+                      ] += 1
+
+                      if (
+                          r.get("name")
+                          and r.get("city")
+                      ):
+
+                          cities[
+                              r["name"]
+                          ].add(
+                              r["city"]
+                          )
+
+              shard_counts[
+                  chunk
+              ] = count
+
+          final = {}
+
+          collisions = {}
+
+          for name, vals in cities.items():
+
+              vals = sorted(vals)
+
+              final[name] = (
+                  vals[0]
+                  if len(vals) == 1
+                  else vals
+              )
+
+              if len(vals) > 1:
+
+                  collisions[
+                      name
+                  ] = vals
+
+          pathlib.Path(
+              "name-to-city.json"
+          ).write_text(
+              json.dumps(
+                  final,
+                  ensure_ascii=False,
+                  indent=2
+              )
+              + "\n"
+          )
+
+          pathlib.Path(
+              "name-to-city-collisions.json"
+          ).write_text(
+              json.dumps(
+                  collisions,
+                  ensure_ascii=False,
+                  indent=2
+              )
+              + "\n"
+          )
+
+          pathlib.Path(
+              "merge-malformed-records.json"
+          ).write_text(
+              json.dumps(
+                  malformed,
+                  ensure_ascii=False,
+                  indent=2
+              )
+              + "\n"
+          )
+
+          summary = {
+
+              "status_counts":
+                  dict(stats),
+
+              "unique_names":
+                  len(final),
+
+              "name_collisions":
+                  len(collisions),
+
+              "malformed_records_skipped":
+                  len(malformed),
+
+              "shard_files":
+                  len(files),
+
+              "records_per_shard":
+                  dict(
+                      sorted(
+                          shard_counts.items()
+                      )
+                  )
+          }
+
+          pathlib.Path(
+              "merge-summary.json"
+          ).write_text(
+              json.dumps(
+                  summary,
+                  indent=2
+              )
+              + "\n"
+          )
+
+          print(
+              json.dumps(
+                  summary,
+                  indent=2
+              )
+          )
+          PY
+
+
+      # --------------------------------------------------------
+      # FINAL RESULT
+      # --------------------------------------------------------
 
       - uses: actions/upload-artifact@v4
         with:
@@ -255,4 +1636,5 @@ jobs:
             name-to-city.json
             name-to-city-collisions.json
             merge-summary.json
+            merge-malformed-records.json
           retention-days: 30
